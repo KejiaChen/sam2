@@ -36,14 +36,19 @@ from matplotlib.animation import FuncAnimation
 import xml.etree.ElementTree as ET
 from scipy.spatial.transform import Rotation as R
 from mpl_toolkits.mplot3d import Axes3D
+import argparse
+import threading
+
 
 class RopeSegmenter:
-    def __init__(self):
+    def __init__(self, show=False):
 
         # Initialize variables
         self.udp_host_1 = '10.157.174.101'
         self.udp_host_2 = '10.157.175.4'
         self.udp_port = 5060
+        self.udp_port2 = 5070
+        self.grasp_port =5080
 
         self.device = self.select_device()
         self.predictor = self.load_predictor()
@@ -62,21 +67,27 @@ class RopeSegmenter:
 
 
 
-        self.rotation_matrix_cam_to_base = np.array([[-0.0309604, -0.67308402, 0.73891769, -0.00963869],
+        # self.rotation_matrix_cam_to_base = np.array([[-0.0309604, -0.67308402, 0.73891769, -0.00963869],
 
-        [-0.99891794 ,-0.00483204, -0.04625586 , 0.27927216],
+        # [-0.99891794 ,-0.00483204, -0.04625586 , 0.27927216],
 
-        [ 0.03470456, -0.73955024, -0.6722061 , 0.43874799],
+        # [ 0.03470456, -0.73955024, -0.6722061 , 0.43874799],
 
-        [ 0. , 0. , 0. , 1. ]]
+        # [ 0. , 0. , 0. , 1. ]]
 
+        # )
+
+        self.rotation_matrix_cam_to_base = np.array([[-0.0561959,  -0.55445018,  0.83031742,  0.0794576 ],
+        [-0.99729112,  0.07070346, -0.02028396,  0.28387145],
+        [-0.04745987, -0.82920807, -0.55692149,  0.31463105],
+        [ 0,          0,          0,          1.        ]]
         )
 
 
         
         self.x_min, self.x_max = -2, 2
         self.y_min, self.y_max = -2, 2
-        self.z_min, self.z_max = 0.2, 2
+        self.z_min, self.z_max = 0.13, 2
         # self.y_threshold = 0.1
 
         self.depth_map_filter_size = 15
@@ -111,6 +122,31 @@ class RopeSegmenter:
         self.frame2_points = np.array([]).reshape(0, 2)
 
         self.initial_translation_direction = None 
+
+        self.show_process = show
+        self.second_grasp_command = False
+
+        # create a server to receive the grasping command for the second robot
+        try:
+            self.grasp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.grasp_sock.bind((self.udp_host_1, self.grasp_port))
+            print(f"Listening on {self.udp_host_1}:{self.grasp_port}")
+
+            # Start a new thread to listen for grasp commands
+            threading.Thread(target=self.listen_for_grasp_commands, args=()).start()
+
+        except Exception as e:
+            print(f"Failed to initialize or bind socket: {e}")
+            self.grasp_sock = None  # Ensure the socket is None if initialization fails
+
+    def listen_for_grasp_commands(self):
+        while True:
+            try:
+                data, addr = self.grasp_sock.recvfrom(1024)  # Buffer size is 1024 bytes
+                self.second_grasp_command = data.decode('utf-8').lower() == 'true'
+            except Exception as e:
+                print(f"Error receiving data: {e}")
+                break
         
     def select_device(self):
         if torch.cuda.is_available():
@@ -350,7 +386,8 @@ class RopeSegmenter:
         # Extract the 3D positions in the base frame
         rope_3d_positions_base = points_base[:, :3]
 
-        # self.plot_3d_points(rope_3d_positions_base)
+        if self.show_process:
+            self.plot_3d_points(rope_3d_positions_base)
 
         print("3D positions of the rope in the base frame:")
         print(len(rope_3d_positions_base))
@@ -402,6 +439,10 @@ class RopeSegmenter:
         interpolated_points = []
         sorted_clusters = sorted(clusters.values(), key=lambda x: np.mean(x[:, 1]))  # Sort based on Y coordinate
 
+        # DEBUG
+        for i, cluster in enumerate(sorted_clusters):
+            print(f"Cluster {i}: y_min={np.min(cluster[:, 1])}, y_max={np.max(cluster[:, 1])}")
+
         if not sorted_clusters:
             print("Sorted clusters are empty.")
             return
@@ -410,15 +451,22 @@ class RopeSegmenter:
             cluster1 = sorted_clusters[i]
             cluster2 = sorted_clusters[i + 1]
 
+            cluster1 = cluster1[np.argsort(cluster1[:, 1])]
+            cluster2 = cluster2[np.argsort(cluster2[:, 1])]
+
             # Add the first cluster segment to the final list
             interpolated_points.extend(cluster1.tolist())
+
+            # DEBUG
+            print(f"cluster1[0]={cluster1[0]} cluster1[-2]={cluster1[-2]} cluster1[-1]={cluster1[-1]} and cluster2[0]={cluster2[0]} cluster2[-2]={cluster2[-2]}  cluster2[-1]={cluster2[-1]}")
 
             # Calculate the gap distance between the two segments
             gap_distance = np.linalg.norm(cluster1[-1] - cluster2[0])
 
             if gap_distance > 0.01:  # 
                 # Use curve_fit to fit a nonlinear curve and generate a smooth transition segment
-                fit_points = np.vstack([cluster1[50:], cluster2[:50]])  # Use 30 points from each cluster
+                # fit_points = np.vstack([cluster1[30:], cluster2[:30]])  # Use 30 points from each cluster
+                fit_points = np.vstack([cluster1[min(30,len(cluster1)):], cluster2[:min(30,len(cluster2))]]) 
                 y = fit_points[:, 1]  # Use Y as input feature
                 x = fit_points[:, 0]  # Fit X and Z
                 z = fit_points[:, 2]
@@ -429,7 +477,10 @@ class RopeSegmenter:
 
                 # Generate intermediate points
                 num_missing = 100  # Number of interpolation points
+                print(f"cluster2={cluster2}")
                 y_missing = np.linspace(cluster1[-1][1], cluster2[0][1], num_missing)
+                print(f"y_missing={y_missing}")
+                
 
                 # Use fitting parameters to generate X and Z for intermediate points
                 x_missing = self.poly_curve(y_missing, *params_x)
@@ -441,9 +492,12 @@ class RopeSegmenter:
 
         # Add the last cluster segment
         if sorted_clusters:
-            interpolated_points.extend(sorted_clusters[-1].tolist())
+            cluster3 = sorted_clusters[-1]
+            cluster3 = cluster3[np.argsort(cluster3[:, 1])]
+            interpolated_points.extend(cluster3.tolist())
         
-        self.plot_clusters_and_interpolated_points(data, labels, interpolated_points)
+        if self.show_process:
+            self.plot_clusters_and_interpolated_points(data, labels, interpolated_points)
 
         return interpolated_points
 
@@ -472,7 +526,7 @@ class RopeSegmenter:
         ax.set_zlabel('Z')
         ax.set_title('DBSCAN Clustering and Interpolated Rope Points')
         ax.set_box_aspect([1, 3, 1])
-        # plt.show()
+        plt.show()
 
     def poly_curve(self, y, *params):
         """
@@ -563,6 +617,43 @@ class RopeSegmenter:
         finally:
             udp_socket.close()
 
+    def send_grasp_point_via_udp2(self, grasp_point):
+        """
+        Send the selected grasp point to the robot through UDP.
+        Args:
+            grasp_point: Tuple of (x, y, z) representing the selected grasp point.
+        """
+        # Create a UDP socket
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        x = float(grasp_point[0])
+        y = float(grasp_point[1])
+        z = float(grasp_point[2])
+
+
+        # Pack the data as a formatted string to send (using JSON format for consistency)
+        message = json.dumps({
+                    "data": {
+                        "init_grasp_position2": {
+                            "x": x,
+                            "y": y,
+                            "z": z
+                        }
+                    }
+                })
+        # Define robot IP and port (use your robot's IP here)
+        robot_ip = self.udp_host_1  # IP of your robot (self.udp_host_1 or self.udp_host_2)
+        robot_port = self.udp_port2
+
+        # Send the grasp point via UDP
+        try:
+            udp_socket.sendto(message.encode('utf-8'), (robot_ip, robot_port))
+            print(f"Grasp point {message} sent to {robot_ip}:{robot_port}")
+        except Exception as e:
+            print(f"Failed to send grasp point: {e}")
+        finally:
+            udp_socket.close()
+
     def depth_data_processing(self, depth_map):
         n = self.depth_map_filter_size
 
@@ -633,8 +724,8 @@ class RopeSegmenter:
         marker.id = 1
         marker.type = Marker.POINTS  # Use POINTS type for individual points
         marker.action = Marker.ADD
-        marker.scale.x = 0.01  # Point width
-        marker.scale.y = 0.01  # Point height (since it's a sphere-like marker)
+        marker.scale.x = 0.03  # Point width
+        marker.scale.y = 0.03  # Point height (since it's a sphere-like marker)
         marker.color.r = 1.0
         marker.color.g = 0.5
         marker.color.b = 0.0
@@ -758,6 +849,40 @@ class RopeSegmenter:
         marker.color.r = 0.0
         marker.color.g = 1.0  # Green color
         marker.color.b = 0.0
+        marker.color.a = 1.0  # Fully opaque
+
+        # Publish the marker
+        self.grasp_point_pub.publish(marker)
+
+    def publish_the_second_grasp_point(self, grasp_point):
+        """
+        Publish a marker for the initial grasp point to RViz.
+        :param grasp_point: 3D point [x, y, z] representing the initial grasp point.
+        """
+        marker = Marker()
+        marker.header.frame_id = "map"  # Replace with your coordinate frame
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "second_grasp_point"
+        marker.id = 3 
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+
+        # Set the pose of the marker (the position of the grasp point)
+        marker.pose.position.x = grasp_point[0]
+        marker.pose.position.y = grasp_point[1]
+        marker.pose.position.z = grasp_point[2]
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0
+
+        # Customize the size and color of the marker
+        marker.scale.x = 0.05  # Sphere radius in meters
+        marker.scale.y = 0.05
+        marker.scale.z = 0.05
+        marker.color.r = 0.0
+        marker.color.g = 0.0  
+        marker.color.b = 1.0 #blue
         marker.color.a = 1.0  # Fully opaque
 
         # Publish the marker
@@ -947,9 +1072,10 @@ class RopeSegmenter:
         dim = (width, height)
         resized_combined_depth_map = cv2.resize(combined_depth_map, dim, interpolation=cv2.INTER_AREA)
 
-        cv2.imshow("Original and Filtered Depth Map", resized_combined_depth_map)
-        cv2.waitKey(0)  
-        cv2.destroyAllWindows()
+        if self.show_process:
+            cv2.imshow("Original and Filtered Depth Map", resized_combined_depth_map)
+            cv2.waitKey(0)  
+            cv2.destroyAllWindows()
 
     
     def replace_and_fit_spline(self, rope_points, intersection_1, intersection_2):
@@ -1008,6 +1134,46 @@ class RopeSegmenter:
         except Exception as e:
             print(f"Error reading file: {e}")
         return None
+    
+    def is_point_on_rope(self, point, rope_points, threshold=0.01):
+        
+        distances = np.linalg.norm(rope_points - point, axis=1)
+        return np.min(distances) < threshold
+
+
+    def get_closest_point(self, point, rope_points):
+        
+        distances = np.linalg.norm(rope_points - point, axis=1)
+        closest_index = np.argmin(distances)
+        return rope_points[closest_index]
+
+    def get_second_grasp(self, smoothed_rope):
+        if len(smoothed_rope) > 0:
+            # Check if init_grasp_point is on the rope
+            if self.is_point_on_rope(self.init_grasp_point, smoothed_rope):
+                # if it is on the rope
+                grasp_index = np.where(np.all(smoothed_rope == self.init_grasp_point, axis=1))[0][0]
+            else:
+                # if it is not on the rope
+                closest_point = self.get_closest_point(self.init_grasp_point, smoothed_rope)
+                grasp_index = np.where(np.all(smoothed_rope == closest_point, axis=1))[0][0]
+
+            # Make sure the index is valid and does not exceed the range.
+            grasp_index = min(grasp_index + 7, len(smoothed_rope) - 1)
+
+            selected_point = smoothed_rope[grasp_index]
+            selected_point = selected_point + np.array([0, -0.562, 0])  
+
+
+            print(f"Selected point from corrected rope: {selected_point}")
+            print(type(selected_point))
+
+            self.send_grasp_point_via_udp2(selected_point)
+
+            selected_point = selected_point + np.array([0, 0.562, 0])  
+            self.publish_the_second_grasp_point(selected_point)
+        else:
+            rospy.logwarn("Corrected rope points are empty. Cannot select or send a point.")
 
 
     def main(self):
@@ -1138,14 +1304,30 @@ class RopeSegmenter:
 
                 # Update the state and propagate using the last frame
                 for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):
+                    
+                    # load each segmented results 
+                    # load the current frame image
+                    frame_path = os.path.join(self.video_dir, last_frame_name)
+                    image = PILImage.open(frame_path)
+
+                    # Show the segmented results
+                    mask = (out_mask_logits[0] > 0.0).cpu().numpy()
+                    if self.show_process:
+                        plt.figure(figsize=(9, 6))
+                        plt.title(f"Segmented Frame {out_frame_idx}")
+                        plt.imshow(image)
+                        self.show_mask(mask, plt.gca(), obj_id=out_obj_ids[0])
+                        plt.show()
+
                     video_segments[out_frame_idx] = {
                         out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
                         for i, out_obj_id in enumerate(out_obj_ids)
                     }
-                for out_frame_idx in range(0, len(frame_names), 1):
-                    plt.figure(figsize=(6, 4))
-                    plt.title(f"frame {out_frame_idx}")
-                    plt.imshow(PILImage.open(os.path.join(self.video_dir, frame_names[out_frame_idx])))
+                if self.show_process:
+                    for out_frame_idx in range(0, len(frame_names), 1):
+                        plt.figure(figsize=(6, 4))
+                        plt.title(f"frame {out_frame_idx}")
+                        plt.imshow(PILImage.open(os.path.join(self.video_dir, frame_names[out_frame_idx])))
                 # Generate 2D rope model using the mask logits
                 averaged_pixel_positions_sorted_asc = self.generate_2d_rope_model(out_mask_logits,'mean')
 
@@ -1158,8 +1340,8 @@ class RopeSegmenter:
                 depth_map_filtered = self.depth_data_processing(depth_map_resized)
                 
                 # Show the depth map filtered
-                # self.show_depth_map(depth_map_resized)
-                # cv2.waitKey(1)  # Adjust this if you need it to auto-close or wait for a keypress
+                self.show_depth_map(depth_map_resized)
+                cv2.waitKey(1)  # Adjust this if you need it to auto-close or wait for a keypress
 
 
                 # Update 3D rope model and select grasp point
@@ -1173,6 +1355,8 @@ class RopeSegmenter:
                     grasp_point_2d = self.select_initial_grasp_point(frame_path)
                     # initial grasp position based on camera reconstuct 3D point in base frame
                     self.init_grasp_point = self.project_2d_to_3d(grasp_point_2d, depth_map_filtered)
+                    print(f"grasp point: {self.init_grasp_point}")
+                    print(type(self.init_grasp_point))
                     self.send_grasp_point_via_udp(self.init_grasp_point)
                     self.init_grasp_flag = True
 
@@ -1194,9 +1378,79 @@ class RopeSegmenter:
                 
                 self.publish_intersection_points(intersection_w_1, intersection_w_2, tcp)
                 self.publish_smoothed_rope_marker(corrected_rope_points, [1,0,0]) #red
-                self.publish_grasp_point(self.init_grasp_point)
+                self.publish_grasp_point(tcp)
                 self.publish_smoothed_rope_marker(interpolated_points,[0,1,0]) #green
                 
+                smoothed_rope = self.smooth_rope_with_spline(corrected_rope_points, smooth_factor=0.05, num_points=30)
+                smoothed_rope = np.array(smoothed_rope)
+                # corrected_rope_points = np.array(corrected_rope_points)
+                # x = corrected_rope_points[:, 0]
+                # y = corrected_rope_points[:, 1]
+                # z = corrected_rope_points[:, 2]
+                x = smoothed_rope [:, 0]
+                y = smoothed_rope [:, 1]
+                z = smoothed_rope [:, 2]
+
+                if self.show_process:
+                    fig = plt.figure(figsize=(10, 8))
+                    ax = fig.add_subplot(111, projection='3d')
+                    ax.plot(x, y, z, marker='o', linestyle='-', label='Smoothed Rope')
+                    ax.set_title('3D Smoothed Rope')
+                    ax.set_xlabel('X Coordinate')
+                    ax.set_ylabel('Y Coordinate')
+                    ax.set_zlabel('Z Coordinate')
+                    ax.legend()
+                    plt.show()
+
+                if self.second_grasp_command:
+                    self.get_second_grasp(smoothed_rope)
+                    self.second_grasp_command = False
+
+                # # Select a point after corrected the rope model and grasp the selected point
+                # if  len(smoothed_rope) > 0:
+                #     smoothed_rope = np.array(smoothed_rope)
+                #     smoothed_rope_index = len(smoothed_rope) // 2 + 10
+                #     selected_point = smoothed_rope[smoothed_rope_index]
+
+
+                #     print(f"Selected point from corrected rope: {selected_point}")
+                #     print(type(selected_point))
+                #     selected_point = selected_point + np.array([0, -0.562, 0])
+                #     self.send_grasp_point_via_udp2(selected_point)
+                # else:
+                #     rospy.logwarn("Corrected rope points are empty. Cannot select or send a point.")
+
+
+                
+
+                # if len(smoothed_rope) > 0:
+                #     # Check if init_grasp_point is on the rope
+                #     if self.is_point_on_rope(self.init_grasp_point, smoothed_rope):
+                #         # if it is on the rope
+                #         grasp_index = np.where(np.all(smoothed_rope == self.init_grasp_point, axis=1))[0][0]
+                #     else:
+                #         # if it is not on the rope
+                #         closest_point = self.get_closest_point(self.init_grasp_point, smoothed_rope)
+                #         grasp_index = np.where(np.all(smoothed_rope == closest_point, axis=1))[0][0]
+
+                #     # Make sure the index is valid and does not exceed the range.
+                #     grasp_index = min(grasp_index + 7, len(smoothed_rope) - 1)
+
+                #     selected_point = smoothed_rope[grasp_index]
+                #     selected_point = selected_point + np.array([0, -0.562, 0])  
+
+
+                #     print(f"Selected point from corrected rope: {selected_point}")
+                #     print(type(selected_point))
+
+                #     self.send_grasp_point_via_udp2(selected_point)
+
+                #     selected_point = selected_point + np.array([0, 0.562, 0])  
+                #     self.publish_the_second_grasp_point(selected_point)
+
+                # else:
+                #     rospy.logwarn("Corrected rope points are empty. Cannot select or send a point.")
+
                 #-------------------------------------------------------------
 
                 #==================================================end time================================================================
@@ -1221,8 +1475,12 @@ class RopeSegmenter:
 
 
 if __name__ == '__main__':
+    # arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--show", type=bool, default=False)
+    args = parser.parse_args()
 
     torch.cuda.empty_cache()
-    segmenter = RopeSegmenter()
+    segmenter = RopeSegmenter(args.show)
 
     segmenter.main()
