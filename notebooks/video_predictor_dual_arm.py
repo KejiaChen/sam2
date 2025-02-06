@@ -38,6 +38,9 @@ from scipy.spatial.transform import Rotation as R
 from mpl_toolkits.mplot3d import Axes3D
 import argparse
 import threading
+from skimage.morphology import skeletonize
+from skimage.graph import route_through_array
+import networkx as nx
 
 
 class RopeSegmenter:
@@ -308,15 +311,22 @@ class RopeSegmenter:
 
         rospy.loginfo("Frame collection complete.")
 
-    # def generate_2d_rope_model(self, out_mask_logits, method='mean'):
     def generate_2d_rope_model(self, out_mask_logits, method='mean', sort_by='x'):
         # Extract 2D Pixel Positions of the Mask
         mask = (out_mask_logits[0] > 0.0).cpu().numpy()  # Convert mask to numpy
         pixel_positions = np.column_stack(np.where(mask))  # Get (c, y, x) positions of mask pixels
+        skeleton = skeletonize(mask)  # Extract the skeleton of the mask
+
+        # Get pixel positions of the skeleton
+        skel_points = np.column_stack(np.where(skeleton))  # (row, col) -> (y, x)
         
         # Extract x and y coordinates
         x_coords = pixel_positions[:, 2]
         y_coords = pixel_positions[:, 1]
+
+        pixel_positions_unsorted = np.column_stack((skel_points[:, 2], skel_points[:, 1]))
+
+        self.plot_2d_points(pixel_positions_unsorted) 
         
         # # Use pandas for efficient grouping and median calculation
         # df = pd.DataFrame({'x': x_coords, 'y': y_coords})
@@ -327,45 +337,28 @@ class RopeSegmenter:
         # else:
         #     print("Please give a method to generate 2d DLO modle.")
 
-        
 
         df = pd.DataFrame({'x': x_coords, 'y': y_coords})
 
         if method == 'mean':
-
             if sort_by == 'x':
-
-                df_2d = df.groupby('x')['y'].median().reset_index() 
-
+                df_2d = df.groupby('x')['y'].mean().reset_index() 
             elif sort_by == 'y':
-
-                df_2d = df.groupby('y')['x'].median().reset_index() 
-
+                df_2d = df.groupby('y')['x'].mean().reset_index() 
             else:
-
                 raise ValueError("Invalid sort_by value. Choose 'x' or 'y'.")
 
         elif method == 'median':
-
             if sort_by == 'x':
-
                 df_2d = df.groupby('x')['y'].median().reset_index()
-
             elif sort_by == 'y':
-
                 df_2d = df.groupby('y')['x'].median().reset_index()
-
             else:
-
                 raise ValueError("Invalid sort_by value. Choose 'x' or 'y'.")
 
         else:
-
             raise ValueError("Invalid method. Choose 'mean' or 'median'.")
 
-
-
-        
         # Convert the DataFrame to a list of tuples and sort by x
         pixel_positions_sorted_asc = df_2d.values.tolist()
 
@@ -373,7 +366,8 @@ class RopeSegmenter:
 
         self.plot_2d_points(pixel_positions_sorted_asc) 
 
-        return pixel_positions_sorted_asc
+        # return pixel_positions_sorted_asc
+        return pixel_positions_unsorted, pixel_positions_sorted_asc
 
 
 
@@ -406,10 +400,10 @@ class RopeSegmenter:
     #     df_2d['distance'] = np.sqrt((df_2d['x'] - reference_point[0]) ** 2 + (df_2d['y'] - reference_point[1]) ** 2)
 
     #     # Sort points by distance
-    #     df_sorted = df_2d.sort_values(by='distance').reset_index(drop=True)
+    #     df_2d = df_2d.sort_values(by='distance').reset_index(drop=True)
 
     #     # Convert to list of tuples
-    #     pixel_positions_sorted = df_sorted[['x', 'y']].values.tolist()
+    #     pixel_positions_sorted = df_2d[['x', 'y']].values.tolist()
 
     #     print(f'pixel_positions_sorted: [{len(pixel_positions_sorted)}]')
 
@@ -544,7 +538,7 @@ class RopeSegmenter:
         # Use DBSCAN clustering
         data = np.array(rope_3d_positions_base)
         # clustering = DBSCAN(eps=0.05, min_samples=45, algorithm="ball_tree").fit(data)
-        clustering = DBSCAN(eps=0.08, min_samples=25, algorithm="ball_tree").fit(data)
+        clustering = DBSCAN(eps=0.02, min_samples=5, algorithm="ball_tree").fit(data)
         labels = clustering.labels_
 
         # Create clusters excluding noise
@@ -1228,7 +1222,7 @@ class RopeSegmenter:
         translated_rope = rope_points_np + translation
         return translated_rope
 
-    def show_depth_map(self, depth_map):
+    def show_depth_map(self, depth_map, positions_unsorted, positions_sorted):
         depth_map_normalized_original = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
         depth_map_uint8_original = np.uint8(depth_map_normalized_original)
         depth_colormap_original = cv2.applyColorMap(depth_map_uint8_original, cv2.COLORMAP_JET)
@@ -1236,6 +1230,30 @@ class RopeSegmenter:
         depth_map_normalized_filtered = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
         depth_map_uint8_filtered = np.uint8(depth_map_normalized_filtered)
         depth_colormap_filtered = cv2.applyColorMap(depth_map_uint8_filtered, cv2.COLORMAP_JET)
+
+        if positions_unsorted is not None and len(positions_unsorted) > 2:
+            # Create a mask with the same dimensions as the depth map
+            mask = np.zeros_like(depth_colormap_original)
+
+            # Draw small circles on the mask at the positions specified by positions_unsorted
+            for position in positions_unsorted:
+                cv2.circle(mask, (int(position[0]), int(position[1])), radius=5, color=(0, 0, 255), thickness=-1)  # Red color in BGR
+
+            # Blend the mask with the depth map to achieve transparency
+            alpha = 0.5  # Transparency factor
+            depth_colormap_original = cv2.addWeighted(depth_colormap_original, 1 - alpha, mask, alpha, 0)
+
+        if positions_sorted is not None and len(positions_sorted) > 2:
+            # Create a mask with the same dimensions as the depth map
+            mask = np.zeros_like(depth_colormap_filtered)
+
+            # Draw small circles on the mask at the positions specified by positions_sorted
+            for position in positions_sorted:
+                cv2.circle(mask, (int(position[0]), int(position[1])), radius=5, color=(0, 0, 255), thickness=-1)  # Red color in BGR
+
+            # Blend the mask with the depth map to achieve transparency
+            alpha = 0.5  # Transparency factor
+            depth_colormap_filtered = cv2.addWeighted(depth_colormap_filtered, 1 - alpha, mask, alpha, 0)
 
         combined_depth_map = np.hstack((depth_colormap_original, depth_colormap_filtered))
 
@@ -1461,7 +1479,6 @@ class RopeSegmenter:
                         plt.imshow(image)
 
                         # Use ginput to let the user select two points
-
                         self.initial_points = plt.ginput(1)  # Allows the user to choose 2 points
                         plt.close()  
 
@@ -1499,7 +1516,7 @@ class RopeSegmenter:
                 plt.show()
 
             if frame_names:
-
+                # ----------------------------- Segmentation -------------------------------------#
                 inference_state = self.predictor.init_state(video_path=self.video_dir)
                 self.predictor.reset_state(inference_state)
 
@@ -1553,7 +1570,7 @@ class RopeSegmenter:
                         plt.title(f"frame {out_frame_idx}")
                         plt.imshow(PILImage.open(os.path.join(self.video_dir, frame_names[out_frame_idx])))
                 # Generate 2D rope model using the mask logits
-                averaged_pixel_positions_sorted_asc = self.generate_2d_rope_model(out_mask_logits,'mean')
+                averaged_pixel_positions_unsorted, averaged_pixel_positions_sorted_asc = self.generate_2d_rope_model(out_mask_logits,'mean')
 
                 # Load the corresponding depth map for the last frame
                 ann_frame_idx = int(os.path.splitext(last_frame_name)[0])
@@ -1564,18 +1581,16 @@ class RopeSegmenter:
                 depth_map_filtered = self.depth_data_processing(depth_map_resized)
                 
                 # Show the depth map filtered
-                self.show_depth_map(depth_map_resized)
-                cv2.waitKey(1)  # Adjust this if you need it to auto-close or wait for a keypress
-
+                self.show_depth_map(depth_map_resized, averaged_pixel_positions_unsorted, averaged_pixel_positions_sorted_asc)
 
                 # Update 3D rope model and select grasp point
-                rope_3d_positions_base = self.get_rope_3d_positions_base(averaged_pixel_positions_sorted_asc, depth_map_filtered)
+                rope_3d_positions_base = self.get_rope_3d_positions_base(averaged_pixel_positions_unsorted, depth_map_filtered)
                 # smoothed_rope = self.smooth_rope_with_spline(rope_3d_positions_base, smooth_factor=0.05, num_points=80)
                 # interpolated_points = self.DBSCAN_filter(smoothed_rope)
                 interpolated_points = self.DBSCAN_filter(rope_3d_positions_base)
 
 
-                # # --------------------- Initial Grasp -----------------------
+                # ----------------------- Correction with Tactile ------------------------- #
                 
                 # if not self.init_grasp_flag:
                 #     grasp_point_2d = self.select_initial_grasp_point(frame_path)
@@ -1649,7 +1664,7 @@ class RopeSegmenter:
                 #     rospy.logwarn("Corrected rope points are empty. Cannot select or send a point.")
 
 
-                
+                # ------------------- Select grasp point on corrected rope ------------------- #
 
                 if len(smoothed_rope) > 0:
                     # Check if init_grasp_point is on the rope
