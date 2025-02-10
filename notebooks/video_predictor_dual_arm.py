@@ -17,6 +17,7 @@ import message_filters
 from std_msgs.msg import Float64MultiArray
 import plotly.graph_objs as go
 from sklearn.cluster import DBSCAN
+from sklearn.decomposition import PCA
 from UDPReceiver import UDPReceiver
 from scipy.optimize import curve_fit
 import socket
@@ -52,6 +53,9 @@ class RopeSegmenter:
         self.udp_port = 5060
         self.udp_port2 = 5070
         self.grasp_port =5080
+        self.raw_cable_port = 5090
+        self.corrected_cable_port = 5091
+        self.intersection_port = 5092
 
         self.device = self.select_device()
         self.predictor = self.load_predictor()
@@ -152,27 +156,27 @@ class RopeSegmenter:
         self.show_process = True
         self.second_grasp_command = False
 
-        # create a server to receive the grasping command for the second robot
-        try:
-            self.grasp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.grasp_sock.bind((self.udp_host_1, self.grasp_port))
-            print(f"Listening on {self.udp_host_1}:{self.grasp_port}")
+        # # create a server to receive the grasping command for the second robot
+        # try:
+        #     self.grasp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        #     self.grasp_sock.bind((self.udp_host_1, self.grasp_port))
+        #     print(f"Listening on {self.udp_host_1}:{self.grasp_port}")
 
-            # Start a new thread to listen for grasp commands
-            threading.Thread(target=self.listen_for_grasp_commands, args=()).start()
+        #     # Start a new thread to listen for grasp commands
+        #     threading.Thread(target=self.listen_for_grasp_commands, args=()).start()
 
-        except Exception as e:
-            print(f"Failed to initialize or bind socket: {e}")
-            self.grasp_sock = None  # Ensure the socket is None if initialization fails
+        # except Exception as e:
+        #     print(f"Failed to initialize or bind socket: {e}")
+        #     self.grasp_sock = None  # Ensure the socket is None if initialization fails
 
-    def listen_for_grasp_commands(self):
-        while True:
-            try:
-                data, addr = self.grasp_sock.recvfrom(1024)  # Buffer size is 1024 bytes
-                self.second_grasp_command = data.decode('utf-8').lower() == 'true'
-            except Exception as e:
-                print(f"Error receiving data: {e}")
-                break
+    # def listen_for_grasp_commands(self):
+    #     while True:
+    #         try:
+    #             data, addr = self.grasp_sock.recvfrom(1024)  # Buffer size is 1024 bytes
+    #             self.second_grasp_command = data.decode('utf-8').lower() == 'true'
+    #         except Exception as e:
+    #             print(f"Error receiving data: {e}")
+    #             break
         
     def select_device(self):
         if torch.cuda.is_available():
@@ -419,11 +423,12 @@ class RopeSegmenter:
 
     
         plt.figure(figsize=(10, 5))
-        plt.plot(x_coords, y_coords, linestyle='-', marker='o', color='blue', label='2D Rope Model')
+        plt.scatter(x_coords, y_coords, color='blue', label='2D Rope Model')
+        # plt.plot(x_coords, y_coords, linestyle='-', marker='o', color='blue', label='2D Rope Model')
 
-        for i in range(len(x_coords) - 1):
-            if abs(x_coords[i] - x_coords[i+1]) > 1: 
-                plt.plot(x_coords[i+1:], y_coords[i+1:], linestyle='-', marker='o', color='blue')
+        # for i in range(len(x_coords) - 1):
+        #     if abs(x_coords[i] - x_coords[i+1]) > 1: 
+        #         plt.plot(x_coords[i+1:], y_coords[i+1:], linestyle='-', marker='o', color='blue')
         plt.axis('equal')
         plt.xlabel('X Position')
         plt.ylabel('Y Position')
@@ -519,7 +524,7 @@ class RopeSegmenter:
                        (point2[2] - point1[2]) ** 2)
 
 
-    def DBSCAN_filter(self, rope_3d_positions_base):
+    def DBSCAN_filter(self, rope_3d_positions_base, dbscan_eps=0.02, dbscan_min_samples=10, pca=False):
         
         # Set 3D workspace limit range
         rope_3d_positions_base = [
@@ -538,7 +543,7 @@ class RopeSegmenter:
         # Use DBSCAN clustering
         data = np.array(rope_3d_positions_base)
         # clustering = DBSCAN(eps=0.05, min_samples=45, algorithm="ball_tree").fit(data)
-        clustering = DBSCAN(eps=0.02, min_samples=5, algorithm="ball_tree").fit(data)
+        clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples, algorithm="ball_tree").fit(data)
         labels = clustering.labels_
 
         # Create clusters excluding noise
@@ -552,15 +557,55 @@ class RopeSegmenter:
             # Return empty fig and interpolated_points
             interpolated_points = []
             return interpolated_points
-        sorted_clusters = sorted(clusters.values(), key=lambda x: np.mean(x[:, 1]))  # Sort based on Y coordinate
-        if len(clusters) <= 1:
-            print("Only one cluster found. Skipping DBSCAN filtering.")
-            
-            return sorted_clusters[0].tolist()
 
-        # Fit and complete each segment
+        if not pca:
+            '''Sort clusters based on Y coordinate'''
+            sorted_clusters = sorted(clusters.values(), key=lambda x: np.mean(x[:, 1]))  # Sort based on Y coordinate
+            if len(clusters) <= 1:
+                print("Only one cluster found. Skipping DBSCAN filtering.")
+        else:
+            '''Sort using PCA'''
+            # TODO@Kejia: consider piecewise PCA in extreme cases
+            # 1. Compute the centroid of each cluster
+            centroids = []
+            for label, points in clusters.items():
+                centroid = np.mean(points, axis=0)
+                centroids.append((label, centroid))
+
+            # 2. Run PCA on the centroids to find the main direction
+            #    (Alternatively, you can run PCA on all rope points if desired)
+            all_centroids = np.array([c[1] for c in centroids])  # shape (num_clusters, 3)
+            # Suppose all_centroids.shape == (n_samples, 3)
+            n_samples = all_centroids.shape[0]   # number of centroids
+            n_features = all_centroids.shape[1]  # should be 3
+
+            n_components = min(3, n_samples, n_features)
+            pca = PCA(n_components=n_components)
+            pca.fit(all_centroids)
+
+            # The principal axis is the eigenvector with the highest variance
+            principal_axis = pca.components_[0]  # shape (3,)
+
+            # 3. Project each centroid onto this principal axis
+            #    The dot product with the principal axis will give us a 1D coordinate
+            #    that we can use for sorting.
+            projections = []
+            for label, centroid in centroids:
+                proj = np.dot(centroid, principal_axis)
+                projections.append((label, proj))
+
+            # 4. Sort clusters by their projected value
+            projections.sort(key=lambda x: x[1])  # sort by the projection along principal_axis
+
+            # 5. Re-order your cluster points accordingly
+            sorted_clusters = [clusters[label] for (label, _) in projections]
+            
+    #     return data, y_sorted_clusters, labels
+
+    # def interpolate_rope_points(self, data, sorted_clusters, labels):
+        '''Fit and complete each segment'''
         interpolated_points = []
-        sorted_clusters = sorted(clusters.values(), key=lambda x: np.mean(x[:, 1]))  # Sort based on Y coordinate
+        # sorted_clusters = sorted(clusters.values(), key=lambda x: np.mean(x[:, 1]))  # Sort based on Y coordinate
 
         # DEBUG
         for i, cluster in enumerate(sorted_clusters):
@@ -568,57 +613,122 @@ class RopeSegmenter:
 
         if not sorted_clusters:
             print("Sorted clusters are empty.")
-            return
+        
+        if not pca:
+            '''Interpolate between clusters based on Y coordinate'''
+            for i in range(len(sorted_clusters) - 1):
+                    cluster1 = sorted_clusters[i]
+                    cluster2 = sorted_clusters[i + 1]
 
-        for i in range(len(sorted_clusters) - 1):
-            cluster1 = sorted_clusters[i]
-            cluster2 = sorted_clusters[i + 1]
+                    cluster1 = cluster1[np.argsort(cluster1[:, 1])]
+                    cluster2 = cluster2[np.argsort(cluster2[:, 1])]
 
-            cluster1 = cluster1[np.argsort(cluster1[:, 1])]
-            cluster2 = cluster2[np.argsort(cluster2[:, 1])]
+                    # Add the first cluster segment to the final list
+                    interpolated_points.extend(cluster1.tolist())
 
-            # Add the first cluster segment to the final list
-            interpolated_points.extend(cluster1.tolist())
+                    # DEBUG
+                    print(f"cluster1[0]={cluster1[0]} cluster1[-2]={cluster1[-2]} cluster1[-1]={cluster1[-1]} and cluster2[0]={cluster2[0]} cluster2[-2]={cluster2[-2]}  cluster2[-1]={cluster2[-1]}")
 
-            # DEBUG
-            print(f"cluster1[0]={cluster1[0]} cluster1[-2]={cluster1[-2]} cluster1[-1]={cluster1[-1]} and cluster2[0]={cluster2[0]} cluster2[-2]={cluster2[-2]}  cluster2[-1]={cluster2[-1]}")
+                    # Calculate the gap distance between the two segments
+                    gap_distance = np.linalg.norm(cluster1[-1] - cluster2[0])
 
-            # Calculate the gap distance between the two segments
-            gap_distance = np.linalg.norm(cluster1[-1] - cluster2[0])
+                    if gap_distance > 0.01:  # 
+                        # Use curve_fit to fit a nonlinear curve and generate a smooth transition segment
+                        # fit_points = np.vstack([cluster1[30:], cluster2[:30]])  # Use 30 points from each cluster
+                        fit_points = np.vstack([cluster1[min(30,len(cluster1)):], cluster2[:min(30,len(cluster2))]]) 
+                        y = fit_points[:, 1]  # Use Y as input feature
+                        x = fit_points[:, 0]  # Fit X and Z
+                        z = fit_points[:, 2]
 
-            if gap_distance > 0.01:  # 
-                # Use curve_fit to fit a nonlinear curve and generate a smooth transition segment
-                # fit_points = np.vstack([cluster1[30:], cluster2[:30]])  # Use 30 points from each cluster
-                fit_points = np.vstack([cluster1[min(30,len(cluster1)):], cluster2[:min(30,len(cluster2))]]) 
-                y = fit_points[:, 1]  # Use Y as input feature
-                x = fit_points[:, 0]  # Fit X and Z
-                z = fit_points[:, 2]
+                        # Use curve_fit for nonlinear curve fitting
+                        params_x, _ = curve_fit(lambda y, *p: self.poly_curve(y, *p), y, x, p0=[1] * (self.poly_order + 1))
+                        params_z, _ = curve_fit(lambda y, *p: self.poly_curve(y, *p), y, z, p0=[1] * (self.poly_order + 1))
 
-                # Use curve_fit for nonlinear curve fitting
-                params_x, _ = curve_fit(lambda y, *p: self.poly_curve(y, *p), y, x, p0=[1] * (self.poly_order + 1))
-                params_z, _ = curve_fit(lambda y, *p: self.poly_curve(y, *p), y, z, p0=[1] * (self.poly_order + 1))
+                        # Generate intermediate points
+                        num_missing = 100  # Number of interpolation points
+                        print(f"cluster2={cluster2}")
+                        y_missing = np.linspace(cluster1[-1][1], cluster2[0][1], num_missing)
+                        print(f"y_missing={y_missing}")
+                        
 
-                # Generate intermediate points
-                num_missing = 100  # Number of interpolation points
-                print(f"cluster2={cluster2}")
-                y_missing = np.linspace(cluster1[-1][1], cluster2[0][1], num_missing)
-                print(f"y_missing={y_missing}")
-                
+                        # Use fitting parameters to generate X and Z for intermediate points
+                        x_missing = self.poly_curve(y_missing, *params_x)
+                        z_missing = self.poly_curve(y_missing, *params_z)
 
-                # Use fitting parameters to generate X and Z for intermediate points
-                x_missing = self.poly_curve(y_missing, *params_x)
-                z_missing = self.poly_curve(y_missing, *params_z)
+                        # Fill in the missing segment
+                        interpolated_segment = np.column_stack((x_missing, y_missing, z_missing))
+                        interpolated_points.extend(interpolated_segment.tolist())
 
-                # Fill in the missing segment
-                interpolated_segment = np.column_stack((x_missing, y_missing, z_missing))
-                interpolated_points.extend(interpolated_segment.tolist())
-
-        # Add the last cluster segment
-        if sorted_clusters:
             cluster3 = sorted_clusters[-1]
             cluster3 = cluster3[np.argsort(cluster3[:, 1])]
             interpolated_points.extend(cluster3.tolist())
         
+        else:
+            '''Interpolate between clusters using PCA'''
+            reference_point = np.mean(data, axis=0)
+            # 1) Convert each cluster into an array of (s, x, y, z), sorted by s
+            clusters_s = []
+            for cluster in sorted_clusters:
+                # Compute s for each point, then store [s, x, y, z]
+                # shape of cluster is (num_points_in_cluster, 3)
+                s_vals = np.dot(cluster - reference_point, principal_axis)
+                cluster_sxyz = np.column_stack([s_vals, cluster])
+                
+                # Sort by s
+                cluster_sxyz = cluster_sxyz[np.argsort(cluster_sxyz[:, 0])]
+                clusters_s.append(cluster_sxyz)
+                
+            # 2) Interpolate between consecutive clusters
+            for i in range(len(clusters_s) - 1):
+                cluster1_sxyz = clusters_s[i]
+                cluster2_sxyz = clusters_s[i+1]
+
+                # Append all points from cluster1
+                interpolated_points.extend(cluster1_sxyz[:, 1:].tolist())  # skip the s column, keep x,y,z
+
+                # Check gap between the last point of cluster1 and the first point of cluster2
+                s1_last = cluster1_sxyz[-1, 0]
+                s2_first = cluster2_sxyz[0, 0]
+                gap_distance = abs(s2_first - s1_last)  # 1D gap in s-space
+
+                # If the gap is "significant," do a polynomial curve fit in s->(x,y,z)
+                if gap_distance > 0.01:
+                    # pick a few points from the end of cluster1 and the start of cluster2
+                    # to define a "bridge"
+                    tail_count = min(30, len(cluster1_sxyz))
+                    head_count = min(30, len(cluster2_sxyz))
+                    fit_points_sxyz = np.vstack([
+                        cluster1_sxyz[-tail_count:], 
+                        cluster2_sxyz[:head_count]
+                    ])
+                    
+                    s_vals = fit_points_sxyz[:, 0]
+                    x_vals = fit_points_sxyz[:, 1]
+                    y_vals = fit_points_sxyz[:, 2]
+                    z_vals = fit_points_sxyz[:, 3]
+
+                    # Fit x(s), y(s), z(s)
+                    p0 = [1]*(self.poly_order+1)  # initial guess, e.g. [1,1,1,...] or zeros
+                    params_x, _ = curve_fit(self.poly_curve, s_vals, x_vals, p0=p0)
+                    params_y, _ = curve_fit(self.poly_curve, s_vals, y_vals, p0=p0)
+                    params_z, _ = curve_fit(self.poly_curve, s_vals, z_vals, p0=p0)
+
+                    # Generate a set of new s-values to fill the gap
+                    num_missing = 100
+                    s_missing = np.linspace(s1_last, s2_first, num_missing)
+
+                    # Evaluate x,y,z from the fits
+                    x_missing = self.poly_curve(s_missing, *params_x)
+                    y_missing = self.poly_curve(s_missing, *params_y)
+                    z_missing = self.poly_curve(s_missing, *params_z)
+
+                    # Combine them into 3D points
+                    interp_segment = np.column_stack([x_missing, y_missing, z_missing])
+                    interpolated_points.extend(interp_segment.tolist())
+
+            # Finally, add the last cluster in full
+            interpolated_points.extend(clusters_s[-1][:, 1:].tolist())
+
         if self.show_process:
             self.plot_clusters_and_interpolated_points(data, labels, interpolated_points)
 
@@ -820,6 +930,38 @@ class RopeSegmenter:
             print(f"Failed to send grasp point: {e}")
         finally:
             udp_socket.close()
+
+    def send_rope_positions_via_udp(self, rope_positions, udp_port):
+        cable_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        # Simulate or get the real rope positions (N x 3 numpy array)
+        # rope_positions = np.random.rand(30, 3)  # Example data, replace with actual positions
+
+        # Convert list of numpy arrays into a single stacked array (N x 3)
+        if isinstance(rope_positions, list):
+            rope_positions = np.vstack(rope_positions)  # Stack into a single numpy array
+
+        # Convert to bytes
+        shape_info = np.array(rope_positions.shape, dtype=np.int32).tobytes()
+        data = rope_positions.astype(np.float64).tobytes()
+
+        # Send via UDP
+        try:
+            cable_socket.sendto(shape_info, (self.udp_host_1, udp_port))  # Send shape first
+
+            # Chunk and send data in multiple packets (UDP limit ~8192 bytes)
+            MAX_UDP_SIZE = 8192
+            for i in range(0, len(data), MAX_UDP_SIZE):
+                end_index = min(i + MAX_UDP_SIZE, len(data))
+                print(f"Sending data chunk from {i} to {end_index - 1}")
+                cable_socket.sendto(data[i:end_index], (self.udp_host_1, udp_port))
+
+            # cable_socket.sendto(shape_info + data, (self.udp_host_1, udp_port))
+            # print(f"Grasp point {message} sent to {robot_ip}:{robot_port}")
+        except Exception as e:
+            print(f"Failed to send rope positions: {e}")
+        finally:
+            cable_socket.close()
 
     def depth_data_processing(self, depth_map):
         n = self.depth_map_filter_size
@@ -1587,8 +1729,11 @@ class RopeSegmenter:
                 rope_3d_positions_base = self.get_rope_3d_positions_base(averaged_pixel_positions_unsorted, depth_map_filtered)
                 # smoothed_rope = self.smooth_rope_with_spline(rope_3d_positions_base, smooth_factor=0.05, num_points=80)
                 # interpolated_points = self.DBSCAN_filter(smoothed_rope)
-                interpolated_points = self.DBSCAN_filter(rope_3d_positions_base)
 
+                # data, clusters, labels = self.DBSCAN_filter(rope_3d_positions_base, dbscan_eps=0.02, dbscan_min_samples=10)
+                # interpolated_points = self.interpolate_rope_points(data, clusters, labels)
+
+                interpolated_points = self.DBSCAN_filter(rope_3d_positions_base, dbscan_eps=0.02, dbscan_min_samples=10, pca=True)
 
                 # ----------------------- Correction with Tactile ------------------------- #
                 
@@ -1618,9 +1763,14 @@ class RopeSegmenter:
 
                 
                 self.publish_intersection_points(intersection_w_1, intersection_w_2, tcp)
-                self.publish_smoothed_rope_marker(corrected_rope_points, [1,0,0]) #red
+                intersection_points = [intersection_w_1, intersection_w_2, tcp]
+                self.send_rope_positions_via_udp(intersection_points, self.intersection_port)
+                # self.send_intersections_via_udp(intersection_w_1, intersection_w_2, tcp, self.intersection_port)
+                self.publish_smoothed_rope_marker(corrected_rope_points, [1,0,0]) # red
+                self.send_rope_positions_via_udp(corrected_rope_points, self.corrected_cable_port)
                 self.publish_grasp_point(tcp)
-                self.publish_smoothed_rope_marker(interpolated_points,[0,1,0]) #green
+                self.publish_smoothed_rope_marker(interpolated_points,[0,1,0]) # green
+                self.send_rope_positions_via_udp(np.array(interpolated_points), self.raw_cable_port)
                 
                 smoothed_rope = self.smooth_rope_with_spline(corrected_rope_points, smooth_factor=0.03, num_points=70)
                 smoothed_rope = np.array(smoothed_rope)
