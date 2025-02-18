@@ -40,9 +40,7 @@ from mpl_toolkits.mplot3d import Axes3D
 import argparse
 import threading
 from skimage.morphology import skeletonize
-from skimage.graph import route_through_array
-import networkx as nx
-
+from utils import *
 
 class RopeSegmenter:
     def __init__(self, show=True):
@@ -598,7 +596,7 @@ class RopeSegmenter:
             projections.sort(key=lambda x: x[1])  # sort by the projection along principal_axis
 
             # 5. Re-order your cluster points accordingly
-            sorted_clusters = [clusters[label] for (label, _) in projections]
+            sorted_clusters = [clusters[label][5:-5] for (label, _) in projections]
             
     #     return data, y_sorted_clusters, labels
 
@@ -746,7 +744,7 @@ class RopeSegmenter:
                 size = 1
             else:
                 color = plt.cm.Spectral(float(label) / len(unique_labels))
-                size = 10
+                size = 3
             class_member_mask = (labels == label)
             xyz = data[class_member_mask]
             ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=[color], s=size)
@@ -812,7 +810,7 @@ class RopeSegmenter:
     #     return grasp_point
 
     
-    def send_grasp_point_via_udp(self, grasp_point):
+    def send_grasp_point_via_udp(self, grasp_point, cable_tagent, read_only=False):
         """
         Send the selected grasp point to the robot through UDP.
         Args:
@@ -820,32 +818,47 @@ class RopeSegmenter:
         """
         # Create a UDP socket
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        
-        x = float(grasp_point[0])
-        y = float(grasp_point[1])
-        z = float(grasp_point[2])
-
-
-        # Pack the data as a formatted string to send (using JSON format for consistency)
-        message = json.dumps({
-                    "data": {
-                        "init_grasp_position": {
-                            "x": x,
-                            "y": y,
-                            "z": z
-                        }
-                    }
-                })
-        # Define robot IP and port (use your robot's IP here)
-        robot_ip = self.udp_host_1  # IP of your robot (self.udp_host_1 or self.udp_host_2)
-        robot_port = self.udp_port
-
-        # Send the grasp point via UDP
         try:
+            if read_only:
+                with open('grasp_point.txt', 'r') as file:
+                    message = file.read()
+
+            else:
+                x = float(grasp_point[0])
+                y = float(grasp_point[1])
+                z = float(grasp_point[2])
+
+
+                # Pack the data as a formatted string to send (using JSON format for consistency)
+                data = {
+                            "data": {
+                                "init_grasp_position": {
+                                    "x": x,
+                                    "y": y,
+                                    "z": z
+                                },
+                                "init_grasp_tangent":{
+                                    "x": float(cable_tagent[0]),
+                                    "y": float(cable_tagent[1]),
+                                    "z": float(cable_tagent[2])
+                                }
+                            }
+                        }
+                with open('grasp_point.txt', 'w') as file:
+                    file.write(json.dumps(data))
+
+                message = json.dumps(data)
+
+            robot_ip = self.udp_host_1  # IP of your robot (self.udp_host_1 or self.udp_host_2)
+            robot_port = self.udp_port
+
+            # Send the grasp point via UDP
             udp_socket.sendto(message.encode('utf-8'), (robot_ip, robot_port))
             print(f"Grasp point {message} sent to {robot_ip}:{robot_port}")
+
         except Exception as e:
             print(f"Failed to send grasp point: {e}")
+            
         finally:
             udp_socket.close()
 
@@ -1362,7 +1375,10 @@ class RopeSegmenter:
         #         translation = -translation
 
         translated_rope = rope_points_np + translation
-        return translated_rope
+
+        grasp_index = (index_1[0][0] + index_2[0][0]) // 2
+        
+        return translated_rope, grasp_index
 
     def show_depth_map(self, depth_map, positions_unsorted, positions_sorted):
         depth_map_normalized_original = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
@@ -1480,7 +1496,7 @@ class RopeSegmenter:
         closest_index = np.argmin(distances)
         return rope_points[closest_index]
 
-    def get_second_grasp(self, smoothed_rope):
+    def get_second_grasp(self, smoothed_rope, initial_grasp_position, desired_distance):
         if len(smoothed_rope) > 0:
             # Check if init_grasp_point is on the rope
             #change the self.init_grasp_point into tcp
@@ -1498,7 +1514,6 @@ class RopeSegmenter:
             selected_point = smoothed_rope[grasp_index]
             selected_point = selected_point + np.array([0, -0.562, 0])  
 
-
             print(f"Selected point from corrected rope: {selected_point}")
             print(type(selected_point))
 
@@ -1508,57 +1523,6 @@ class RopeSegmenter:
             self.publish_the_second_grasp_point(selected_point)
         else:
             rospy.logwarn("Corrected rope points are empty. Cannot select or send a point.")
-    
-    def calculate_tangent_and_rotation(self, smoothed_rope, grasp_index):
-
-        """
-
-        Calculate the tangent direction of the extracted point and convert it to the rotation angle around the x, y, z axis (rx, ry, rz)
-
-        smoothed_rope: 3D trajectory point list (Nx3 numpy array)
-
-        grasp_index: The index of the selected grasp point
-
-        return: The tangent direction (tangent_vector) and the rotation angle around the (x, y, z) axis (rx, ry, rz)
-
-        """
-
-        if len(smoothed_rope) < 2:
-
-            rospy.logwarn("Rope points are too few to compute a tangent vector.")
-            return None, None, None
-        # Get the previous and next points for the selected grasp point
-
-        if grasp_index == 0:
-            prev_point = smoothed_rope[grasp_index]
-            next_point = smoothed_rope[grasp_index + 1]
-
-        elif grasp_index == len(smoothed_rope) - 1:
-            prev_point = smoothed_rope[grasp_index - 1]
-            next_point = smoothed_rope[grasp_index]
-
-        else:
-            prev_point = smoothed_rope[grasp_index - 1]
-            next_point = smoothed_rope[grasp_index + 1]
-
-    
-        # Compute the tangent vector
-
-        tangent_vector = next_point - prev_point
-
-        tangent_vector = tangent_vector / np.linalg.norm(tangent_vector)
-
-        # Compute the rotation angles (in degrees) around the x, y, z axes
-        # yaw rotation (around z-axis)
-        yaw = np.arctan2(tangent_vector[1], tangent_vector[0])
-
-        # pitch rotation (around y-axis)
-        pitch = np.arctan2(-tangent_vector[2], np.sqrt(tangent_vector[0]**2 + tangent_vector[1]**2))
-
-        # roll rotation (around x-axis)
-        roll = 0
-        return tangent_vector, np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
-
 
     def main(self):
 
@@ -1754,7 +1718,7 @@ class RopeSegmenter:
                 # # # translation_vector = center_of_grasp - tcp
                 # closest_point_1, closest_point_2 = self.find_closest_points_sam2(interpolated_points, intersection_w_1, intersection_w_2, self.init_grasp_point)
                 # # corrected_rope_points = self.align_and_correct_rope_model(interpolated_points, intersection_w_1, intersection_w_2)
-                corrected_rope_points = self.correct_rope_model(interpolated_points,intersection_w_1, intersection_w_2)
+                corrected_rope_points, corrected_tcp_index = self.correct_rope_model(interpolated_points,intersection_w_1, intersection_w_2)
                 # # # Calculate the translation vector to correct the rope position
                 # translation_vector = self.calculate_translation(intersection_w_1, intersection_w_2, closest_point_1, closest_point_2)
 
@@ -1775,9 +1739,9 @@ class RopeSegmenter:
                 smoothed_rope = self.smooth_rope_with_spline(corrected_rope_points, smooth_factor=0.03, num_points=70)
                 smoothed_rope = np.array(smoothed_rope)
                 # corrected_rope_points = np.array(corrected_rope_points)
-                # x = corrected_rope_points[:, 0]
-                # y = corrected_rope_points[:, 1]
-                # z = corrected_rope_points[:, 2]
+                x1 = corrected_rope_points[:, 0]
+                y1 = corrected_rope_points[:, 1]
+                z1 = corrected_rope_points[:, 2]
                 x = smoothed_rope [:, 0]
                 y = smoothed_rope [:, 1]
                 z = smoothed_rope [:, 2]
@@ -1786,6 +1750,7 @@ class RopeSegmenter:
                     fig = plt.figure(figsize=(10, 8))
                     ax = fig.add_subplot(111, projection='3d')
                     ax.plot(x, y, z, marker='o', linestyle='-', label='Smoothed Rope')
+                    ax.plot(x1, y1, z1, marker='o', linestyle='-', label='Corrected Rope')
                     ax.set_title('3D Smoothed Rope')
                     ax.set_xlabel('X Coordinate')
                     ax.set_ylabel('Y Coordinate')
@@ -1815,69 +1780,65 @@ class RopeSegmenter:
 
 
                 # ------------------- Select grasp point on corrected rope ------------------- #
-
+                desired_distance = 0.15  # Desired distance from the initial grasp point
                 if len(smoothed_rope) > 0:
-                    # Check if init_grasp_point is on the rope
-                    if self.is_point_on_rope(tcp, smoothed_rope):
-                        # # if it is on the rope
-                        # matched_indices = np.where(np.isclose(smoothed_rope, tcp, atol=1e-5).all(axis=1))[0]
-                        # if matched_indices.size == 0:
-                        #     print("TCP is close to the rope but not exactly on it.")
-                        #     return None
-                        # grasp_index = matched_indices[0]
-                        grasp_index = np.where(np.all(smoothed_rope == tcp, axis=1))[0][0]
-                    else:
-                        # if it is not on the rope
-                        closest_point = self.get_closest_point(tcp, smoothed_rope)
-                        grasp_index = np.where(np.all(smoothed_rope == closest_point, axis=1))[0][0]
+                    # # Check if init_grasp_point is on the rope
+                    # if self.is_point_on_rope(tcp, smoothed_rope):
+                    #     # # if it is on the rope
+                    #     # matched_indices = np.where(np.isclose(smoothed_rope, tcp, atol=1e-5).all(axis=1))[0]
+                    #     # if matched_indices.size == 0:
+                    #     #     print("TCP is close to the rope but not exactly on it.")
+                    #     #     return None
+                    #     # grasp_index = matched_indices[0]
+                    #     grasp_index = np.where(np.all(smoothed_rope == tcp, axis=1))[0][0]
+                    # else:
+                    #     # if it is not on the rope
+                    #     closest_point = self.get_closest_point(tcp, smoothed_rope)
+                    #     grasp_index = np.where(np.all(smoothed_rope == closest_point, axis=1))[0][0]
 
                     # Make sure the index is valid and does not exceed the range.
-                    # grasp_index = min(grasp_index - 30, len(smoothed_rope) - 1)
-                    grasp_index = min(grasp_index - 35, len(smoothed_rope) - 1)
+                    # grasp_index = min(grasp_index - 35, len(smoothed_rope) - 1)
+
+                    # selected_point = smoothed_rope[grasp_index]
+                    # tangent_vector, rx, ry, rz = self.calculate_tangent_and_rotation(smoothed_rope, grasp_index)
+                    
+                    distances = np.linalg.norm(smoothed_rope - tcp, axis=1)
+                    tcp_index = np.argmin(distances)
+
+                    grasp_index = None
+                    if grasp_index is None:
+                        # Filter distances to consider only indices greater than grasp_index
+                        greater_filtered_distances = distances[tcp_index + 1:]
+                        closest_index_in_greater_filtered = np.argmin(np.abs(greater_filtered_distances - desired_distance))
+                        closest_index_greater = closest_index_in_greater_filtered + tcp_index + 1
+                        greater_selected_point = smoothed_rope[closest_index_greater]
+
+                        print(f"Greater selected point: {greater_selected_point}")
+
+                        # TODO@Kejia: temporary solution: select one that is larger in x
+                        if greater_selected_point[0] < tcp[0]:
+                            grasp_index = closest_index_greater
+                    
+                    if grasp_index is None:
+                        # Filter distances to consider only indices smaller than tcp_index
+                        smaller_filtered_distances = distances[:tcp_index]
+                        closest_index_in_smaller_filtered = np.argmin(np.abs(smaller_filtered_distances - desired_distance))
+                        closest_index_smaller = closest_index_in_smaller_filtered
+                        smaller_selected_point = smoothed_rope[closest_index_smaller]
+
+                        if smaller_selected_point[0] < tcp[0]:
+                            grasp_index = closest_index_smaller
 
                     selected_point = smoothed_rope[grasp_index]
-                    tangent_vector, rx, ry, rz = self.calculate_tangent_and_rotation(smoothed_rope, grasp_index)
+                    tangent_vector_at_grasp = compute_tanget_vector_at_grasping(smoothed_rope, grasp_index)
                     
-
-
                     print(f"Selected point from corrected rope: {selected_point}")
                     print(f"The tcp of the ur robot: {tcp}")
                     print(type(selected_point))
 
-                # corrected_rope = np.array(corrected_rope_points)
-                # if len(corrected_rope) > 0:
-                #     # Check if init_grasp_point is on the rope
-                #     if self.is_point_on_rope(tcp, corrected_rope):
-                #         # # if it is on the rope
-                #         # matched_indices = np.where(np.isclose(corrected_rope, tcp, atol=1e-5).all(axis=1))[0]
-                #         # if matched_indices.size == 0:
-                #         #     print("TCP is close to the rope but not exactly on it.")
-                #         #     return None
-                #         # grasp_index = matched_indices[0]
-                #         grasp_index = np.where(np.all(corrected_rope == tcp, axis=1))[0][0]
-                #     else:
-                #         # if it is not on the rope
-                #         closest_point = self.get_closest_point(tcp, corrected_rope)
-                #         grasp_index = np.where(np.all(corrected_rope == closest_point, axis=1))[0][0]
-
-                #     # Make sure the index is valid and does not exceed the range.
-                #     # grasp_index = min(grasp_index - 30, len(corrected_rope) - 1)
-                #     grasp_index = min(grasp_index - 67, len(corrected_rope) - 1)
-
-                #     selected_point = corrected_rope[grasp_index]
-                #     tangent_vector, rx, ry, rz = self.calculate_tangent_and_rotation(corrected_rope, grasp_index)
-                    
-
-
-                #     print(f"Selected point from corrected rope: {selected_point}")
-                #     print(f"The tcp of the ur robot: {tcp}")
-                #     print(type(selected_point))
-
                     # self.send_grasp_point_via_udp(selected_point, rx, ry, rz)
-                    self.send_grasp_point_via_udp(selected_point)
+                    self.send_grasp_point_via_udp(selected_point, tangent_vector_at_grasp)
 
-
-                    
                     self.publish_the_second_grasp_point(selected_point)
 
                 else:
@@ -1910,9 +1871,13 @@ if __name__ == '__main__':
     # arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("--show", type=bool, default=False)
+    parser.add_argument("--send_grasp_only", type=bool, default=True)
     args = parser.parse_args()
 
     torch.cuda.empty_cache()
     segmenter = RopeSegmenter(args.show)
 
-    segmenter.main()
+    if args.send_grasp_only:
+        segmenter.send_grasp_point_via_udp(None, None, read_only=True)
+    else:
+        segmenter.main()
