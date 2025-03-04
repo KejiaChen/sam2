@@ -41,9 +41,10 @@ import argparse
 import threading
 from skimage.morphology import skeletonize
 from utils import *
+from scipy.spatial import distance
 
 class RopeSegmenter:
-    def __init__(self, show=True):
+    def __init__(self, show=True, second_grasp=True, tactile_correction=True, desired_distance=0.1):
 
         # Initialize variables
         self.udp_host_1 = '192.168.1.7'
@@ -52,7 +53,7 @@ class RopeSegmenter:
         self.udp_port2 = 5070
         self.grasp_port =5080
         self.raw_cable_port = 5090
-        self.corrected_cable_port = 5091
+        self.corrected_cable_port = 5093
         self.intersection_port = 5092
 
         self.device = self.select_device()
@@ -103,12 +104,18 @@ class RopeSegmenter:
         # [ 0. ,         0.,          0.,          1.        ]]
         # )#the best one calibrated with Florian
 
+        # self.rotation_matrix_cam_to_base = np.array(
+        # [[ 0.9985546,  -0.05301104, -0.00886221,  0.58917246],
+        # [-0.02344179, -0.5779399,  0.81574258, -0.39357788],
+        # [-0.04836519, -0.81435576, -0.57834722,  0.60991091],
+        # [ 0.,          0.,          0.,          1.        ]]
+        # )#after changed the camera position
+
         self.rotation_matrix_cam_to_base = np.array(
-        [[ 0.9985546,  -0.05301104, -0.00886221,  0.58917246],
-        [-0.02344179, -0.5779399,  0.81574258, -0.39357788],
-        [-0.04836519, -0.81435576, -0.57834722,  0.60991091],
-        [ 0.,          0.,          0.,          1.        ]]
-        )#after changed the camera position
+            [[ 0.99959712, -0.02651492, -0.01012703,  0.5945493 ],
+            [-0.00847532, -0.61935895,  0.7850622,  -0.39871874],
+            [-0.02708813, -0.78466008, -0.61933415,  0.60984852],
+            [ 0.,          0.,          0.,          1.        ]])
 
 
 
@@ -151,8 +158,10 @@ class RopeSegmenter:
 
         self.initial_translation_direction = None 
 
-        self.show_process = True
-        self.second_grasp_command = False
+        self.show_process = show
+        self.second_grasp_command = second_grasp
+        self.tactile_correction = tactile_correction
+        self.desired_distance = desired_distance
 
         # # create a server to receive the grasping command for the second robot
         # try:
@@ -208,9 +217,10 @@ class RopeSegmenter:
         if random_color:
             color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
         else:
-            cmap = plt.get_cmap("tab10")
-            cmap_idx = 0 if obj_id is None else obj_id
-            color = np.array([*cmap(cmap_idx)[:3], 0.6])
+        #     cmap = plt.get_cmap("tab20b")
+        #     cmap_idx = 0 if obj_id is None else obj_id
+        #     color = np.array([*cmap(cmap_idx)[:3], 0.6])
+            color = np.array([1, 0, 1, 0.6])  # magenta color with alpha 0.6
         h, w = mask.shape[-2:]
         mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
         ax.imshow(mask_image)
@@ -327,8 +337,9 @@ class RopeSegmenter:
         y_coords = pixel_positions[:, 1]
 
         pixel_positions_unsorted = np.column_stack((skel_points[:, 2], skel_points[:, 1]))
-
-        self.plot_2d_points(pixel_positions_unsorted) 
+        
+        if self.show_process:
+            self.plot_2d_points(pixel_positions_unsorted) 
         
         # # Use pandas for efficient grouping and median calculation
         # df = pd.DataFrame({'x': x_coords, 'y': y_coords})
@@ -366,7 +377,8 @@ class RopeSegmenter:
 
         print(f'median_pixel_positions: [{len(pixel_positions_sorted_asc)}]') 
 
-        self.plot_2d_points(pixel_positions_sorted_asc) 
+        if self.show_process:
+            self.plot_2d_points(pixel_positions_sorted_asc) 
 
         # return pixel_positions_sorted_asc
         return pixel_positions_unsorted, pixel_positions_sorted_asc
@@ -446,9 +458,9 @@ class RopeSegmenter:
 
         ax.scatter(xs, ys, zs, s=1, c=zs, cmap='viridis', alpha=0.9) 
         ax.set_aspect('equal')
-        ax.set_xlabel('X (Base Frame)')
-        ax.set_ylabel('Y (Base Frame)')
-        ax.set_zlabel('Z (Base Frame)')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
         ax.set_title('3D Rope Model in Base Frame')
 
         ax.set_box_aspect([1, 3, 1])
@@ -558,7 +570,7 @@ class RopeSegmenter:
 
         if not pca:
             '''Sort clusters based on Y coordinate'''
-            sorted_clusters = sorted(clusters.values(), key=lambda x: np.mean(x[:, 1]))  # Sort based on Y coordinate
+            sorted_clusters = sorted(clusters.values(), key=lambda x: np.mean(x[:, 0]))  # Sort based on X coordinate
             if len(clusters) <= 1:
                 print("Only one cluster found. Skipping DBSCAN filtering.")
         else:
@@ -596,18 +608,24 @@ class RopeSegmenter:
             projections.sort(key=lambda x: x[1])  # sort by the projection along principal_axis
 
             # 5. Re-order your cluster points accordingly
-            sorted_clusters = [clusters[label][5:-5] for (label, _) in projections]
+            sorted_clusters = []
+            for (label, _) in projections:
+                prune_head_and_tail = min(20, len(clusters[label])//4)
+                sorted_clusters.append(clusters[label][prune_head_and_tail:-prune_head_and_tail])
             
     #     return data, y_sorted_clusters, labels
 
     # def interpolate_rope_points(self, data, sorted_clusters, labels):
         '''Fit and complete each segment'''
         interpolated_points = []
+        gap_centers_1 = []
+        gap_centers_2 = []
+        gap_ceneter_indexs = []
         # sorted_clusters = sorted(clusters.values(), key=lambda x: np.mean(x[:, 1]))  # Sort based on Y coordinate
 
         # DEBUG
         for i, cluster in enumerate(sorted_clusters):
-            print(f"Cluster {i}: y_min={np.min(cluster[:, 1])}, y_max={np.max(cluster[:, 1])}")
+            print(f"Cluster {i}: y_min={np.min(cluster[:, 1])}, y_max={np.max(cluster[:, 1])}, num_points={len(cluster)}")
 
         if not sorted_clusters:
             print("Sorted clusters are empty.")
@@ -618,8 +636,8 @@ class RopeSegmenter:
                     cluster1 = sorted_clusters[i]
                     cluster2 = sorted_clusters[i + 1]
 
-                    cluster1 = cluster1[np.argsort(cluster1[:, 1])]
-                    cluster2 = cluster2[np.argsort(cluster2[:, 1])]
+                    cluster1 = cluster1[np.argsort(cluster1[:, 0])]
+                    cluster2 = cluster2[np.argsort(cluster2[:, 0])]
 
                     # Add the first cluster segment to the final list
                     interpolated_points.extend(cluster1.tolist())
@@ -634,28 +652,38 @@ class RopeSegmenter:
                         # Use curve_fit to fit a nonlinear curve and generate a smooth transition segment
                         # fit_points = np.vstack([cluster1[30:], cluster2[:30]])  # Use 30 points from each cluster
                         fit_points = np.vstack([cluster1[min(30,len(cluster1)):], cluster2[:min(30,len(cluster2))]]) 
-                        y = fit_points[:, 1]  # Use Y as input feature
-                        x = fit_points[:, 0]  # Fit X and Z
+                        x = fit_points[:, 0]  # Use x as input feature
+                        y = fit_points[:, 1]  # Fit Y and Z
                         z = fit_points[:, 2]
 
                         # Use curve_fit for nonlinear curve fitting
-                        params_x, _ = curve_fit(lambda y, *p: self.poly_curve(y, *p), y, x, p0=[1] * (self.poly_order + 1))
-                        params_z, _ = curve_fit(lambda y, *p: self.poly_curve(y, *p), y, z, p0=[1] * (self.poly_order + 1))
+                        params_y, _ = curve_fit(lambda x, *p: self.poly_curve(x, *p), x, y, p0=[1] * (self.poly_order + 1))
+                        params_z, _ = curve_fit(lambda x, *p: self.poly_curve(x, *p), x, z, p0=[1] * (self.poly_order + 1))
 
                         # Generate intermediate points
                         num_missing = 100  # Number of interpolation points
                         print(f"cluster2={cluster2}")
-                        y_missing = np.linspace(cluster1[-1][1], cluster2[0][1], num_missing)
-                        print(f"y_missing={y_missing}")
+                        x_missing = np.linspace(cluster1[-1][0], cluster2[0][0], num_missing)
+                        print(f"x_missing={x_missing}")
                         
 
                         # Use fitting parameters to generate X and Z for intermediate points
-                        x_missing = self.poly_curve(y_missing, *params_x)
-                        z_missing = self.poly_curve(y_missing, *params_z)
+                        y_missing = self.poly_curve(x_missing, *params_y)
+                        z_missing = self.poly_curve(x_missing, *params_z)
 
                         # Fill in the missing segment
                         interpolated_segment = np.column_stack((x_missing, y_missing, z_missing))
                         interpolated_points.extend(interpolated_segment.tolist())
+
+                        gap_center_1 = (cluster1[-1] + cluster2[0])/2
+                        # gap center index on interpolated_points
+                        gap_centers_1.append(gap_center_1)
+
+                        gap_center_2 = np.mean(interpolated_segment, axis=0)
+                        gap_centers_2.append(gap_center_2)
+
+                        gap_center_index = len(interpolated_points) - num_missing//2
+                        gap_ceneter_indexs.append(gap_center_index)
 
             cluster3 = sorted_clusters[-1]
             cluster3 = cluster3[np.argsort(cluster3[:, 1])]
@@ -693,8 +721,8 @@ class RopeSegmenter:
                 if gap_distance > 0.01:
                     # pick a few points from the end of cluster1 and the start of cluster2
                     # to define a "bridge"
-                    tail_count = min(30, len(cluster1_sxyz))
-                    head_count = min(30, len(cluster2_sxyz))
+                    tail_count = min(20, len(cluster1_sxyz))
+                    head_count = min(20, len(cluster2_sxyz))
                     fit_points_sxyz = np.vstack([
                         cluster1_sxyz[-tail_count:], 
                         cluster2_sxyz[:head_count]
@@ -724,33 +752,51 @@ class RopeSegmenter:
                     interp_segment = np.column_stack([x_missing, y_missing, z_missing])
                     interpolated_points.extend(interp_segment.tolist())
 
+                    gap_center_1 = (cluster1_sxyz[-1] + cluster2_sxyz[0])/2
+                    # gap center index on interpolated_points
+                    gap_centers_1.append(gap_center_1[:3])
+
+                    gap_center_2 = np.mean(interp_segment, axis=0)
+                    gap_centers_2.append(gap_center_2)
+
+                    gap_center_index = len(interpolated_points) - num_missing//2
+                    gap_ceneter_indexs.append(gap_center_index)
+
             # Finally, add the last cluster in full
             interpolated_points.extend(clusters_s[-1][:, 1:].tolist())
 
         if self.show_process:
-            self.plot_clusters_and_interpolated_points(data, labels, interpolated_points)
+            self.plot_clusters_and_interpolated_points(data, labels, interpolated_points, None, gap_centers_2)
 
-        return interpolated_points
+        return interpolated_points, gap_centers_2, gap_ceneter_indexs
 
-    def plot_clusters_and_interpolated_points(self, data, labels, interpolated_points):
+    def plot_clusters_and_interpolated_points(self, data, labels, interpolated_points, gap_centers_1, gap_centers_2):
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
 
         unique_labels = set(labels)
+        cmap = plt.get_cmap('plasma')  # You can choose any colormap you prefer
         for label in unique_labels:
             if label == -1:
                 # noise
                 color = 'grey'
                 size = 1
             else:
-                color = plt.cm.Spectral(float(label) / len(unique_labels))
-                size = 3
+                color = cmap(float(label) / len(unique_labels))
+                size = 10
             class_member_mask = (labels == label)
             xyz = data[class_member_mask]
             ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=[color], s=size)
 
         interpolated_points = np.array(interpolated_points)
-        ax.plot(interpolated_points[:, 0], interpolated_points[:, 1], interpolated_points[:, 2], c='blue', linewidth=2)
+        ax.plot(interpolated_points[:, 0], interpolated_points[:, 1], interpolated_points[:, 2], c='yellow', linewidth=6)
+
+        if gap_centers_1:
+            for center in gap_centers_1:
+                ax.scatter(center[0], center[1], center[2], c='blue', s=30)
+        if gap_centers_2:
+            for center in gap_centers_2:
+                ax.scatter(center[0], center[1], center[2], c='green', s=30)
 
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
@@ -810,7 +856,7 @@ class RopeSegmenter:
     #     return grasp_point
 
     
-    def send_grasp_point_via_udp(self, grasp_point, cable_tagent, read_only=False):
+    def send_grasp_point_via_udp(self, grasp_point, cable_tagent, cable_normal, read_only=False):
         """
         Send the selected grasp point to the robot through UDP.
         Args:
@@ -841,6 +887,11 @@ class RopeSegmenter:
                                     "x": float(cable_tagent[0]),
                                     "y": float(cable_tagent[1]),
                                     "z": float(cable_tagent[2])
+                                },
+                                "init_grasp_normal":{
+                                    "x": float(cable_normal[0]),
+                                    "y": float(cable_normal[1]),
+                                    "z": float(cable_normal[2])
                                 }
                             }
                         }
@@ -858,7 +909,7 @@ class RopeSegmenter:
 
         except Exception as e:
             print(f"Failed to send grasp point: {e}")
-            
+
         finally:
             udp_socket.close()
 
@@ -957,6 +1008,11 @@ class RopeSegmenter:
         # Convert to bytes
         shape_info = np.array(rope_positions.shape, dtype=np.int32).tobytes()
         data = rope_positions.astype(np.float64).tobytes()
+
+        # save it locally to txt
+        file_path = 'rope_positions_' + str(udp_port) + '.txt'
+        with open(file_path, 'w') as file:
+            file.write(json.dumps(rope_positions.tolist()))
 
         # Send via UDP
         try:
@@ -1211,7 +1267,8 @@ class RopeSegmenter:
         self.grasp_point_pub.publish(marker)
 
     def publish_smoothed_rope_marker(self, rope_points, color):
-        smoothed_rope = self.smooth_rope_with_spline(rope_points, smooth_factor=0.05, num_points=30)
+        # smoothed_rope = self.smooth_rope_with_spline(rope_points, smooth_factor=0.05, num_points=30)
+        smoothed_rope = rope_points
 
         # ROS Marker definition
         marker = Marker()
@@ -1337,7 +1394,7 @@ class RopeSegmenter:
         return grasp_point_base
     
 
-    def correct_rope_model(self, rope_points, intersection_1, intersection_2):
+    def correct_rope_model(self, rope_points, intersection_1, intersection_2, z_axis):
         """
         Correct the rope model to pass accurately through the given intersection points using translation only.
         :param rope_points: List of 3D points representing the initial rope model.
@@ -1363,6 +1420,7 @@ class RopeSegmenter:
 
         # Calculate the translation to align the model's midpoint to the ground truth midpoint
         translation = midpoint_true - midpoint_model
+        print(f"Translation vector: {translation}")
 
         # # Step 3: Ensure the translation follows the initial direction
         # if self.initial_translation_direction is None:
@@ -1376,9 +1434,40 @@ class RopeSegmenter:
 
         translated_rope = rope_points_np + translation
 
-        grasp_index = (index_1[0][0] + index_2[0][0]) // 2
+        # grasp_index = (index_1[0][0] + index_2[0][0]) // 2
+        grasp_index = (index_1 + index_2) // 2
         
         return translated_rope, grasp_index
+    
+    def correct_rope_model2(self, rope_points, intersection_1, intersection_2, gap_centers, gap_center_indexes):
+        rope_points_np = np.array(rope_points)
+
+        grasp_point_true = (np.array(intersection_1) + np.array(intersection_2)) / 2
+
+        gap_distance = 10
+        gap_index = 0
+        grasp_index = 0
+        for i, center in enumerate(gap_centers):
+            new_gap_distance = np.linalg.norm(grasp_point_true - center)
+            print(f"Gap {i} distance: {new_gap_distance}")
+            if new_gap_distance < gap_distance:
+                gap_distance = new_gap_distance
+                gap_index = i
+                grasp_index = gap_center_indexes[i]
+
+        grasp_point = gap_centers[gap_index]
+
+        # Calculate the translation to align the model's midpoint to the ground truth midpoint
+        translation = grasp_point_true - grasp_point
+        print(f"Translation vector: {translation}")
+        
+        # neighbors = NearestNeighbors(n_neighbors=1)
+        # neighbors.fit(rope_points_np)
+        # _, grasp_index = neighbors.kneighbors([grasp_point])
+
+        translated_rope = rope_points_np + translation
+        
+        return translated_rope, grasp_index  
 
     def show_depth_map(self, depth_map, positions_unsorted, positions_sorted):
         depth_map_normalized_original = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
@@ -1395,23 +1484,30 @@ class RopeSegmenter:
 
             # Draw small circles on the mask at the positions specified by positions_unsorted
             for position in positions_unsorted:
-                cv2.circle(mask, (int(position[0]), int(position[1])), radius=5, color=(0, 0, 255), thickness=-1)  # Red color in BGR
+                cv2.circle(mask, (int(position[0]), int(position[1])), radius=5, color=(255, 0, 255), thickness=-1)  # Red color in BGR
 
-            # Blend the mask with the depth map to achieve transparency
-            alpha = 0.5  # Transparency factor
-            depth_colormap_original = cv2.addWeighted(depth_colormap_original, 1 - alpha, mask, alpha, 0)
+            # Create a binary mask where the circles are drawn
+            binary_mask = np.zeros_like(depth_colormap_filtered[:, :, 0])
+            for position in positions_unsorted:
+                cv2.circle(binary_mask, (int(position[0]), int(position[1])), radius=5, color=1, thickness=-1)
 
-        if positions_sorted is not None and len(positions_sorted) > 2:
-            # Create a mask with the same dimensions as the depth map
-            mask = np.zeros_like(depth_colormap_filtered)
+            # Blend the mask with the depth map to achieve transparency only in the masked areas
+            alpha = 1  # Transparency factor
+            depth_colormap_filtered[binary_mask == 1] = cv2.addWeighted(
+                depth_colormap_filtered[binary_mask == 1], 1 - alpha, mask[binary_mask == 1], alpha, 0
+            )
 
-            # Draw small circles on the mask at the positions specified by positions_sorted
-            for position in positions_sorted:
-                cv2.circle(mask, (int(position[0]), int(position[1])), radius=5, color=(0, 0, 255), thickness=-1)  # Red color in BGR
+        # if positions_sorted is not None and len(positions_sorted) > 2:
+        #     # Create a mask with the same dimensions as the depth map
+        #     mask = np.zeros_like(depth_colormap_filtered)
 
-            # Blend the mask with the depth map to achieve transparency
-            alpha = 0.5  # Transparency factor
-            depth_colormap_filtered = cv2.addWeighted(depth_colormap_filtered, 1 - alpha, mask, alpha, 0)
+        #     # Draw small circles on the mask at the positions specified by positions_sorted
+        #     for position in positions_sorted:
+        #         cv2.circle(mask, (int(position[0]), int(position[1])), radius=5, color=(0, 0, 255), thickness=-1)  # Red color in BGR
+
+        #     # Blend the mask with the depth map to achieve transparency
+        #     alpha = 0.5  # Transparency factor
+        #     depth_colormap_filtered = cv2.addWeighted(depth_colormap_filtered, 1 - alpha, mask, alpha, 0)
 
         combined_depth_map = np.hstack((depth_colormap_original, depth_colormap_filtered))
 
@@ -1420,6 +1516,9 @@ class RopeSegmenter:
         height = int(combined_depth_map.shape[0] * scale_percent / 100)
         dim = (width, height)
         resized_combined_depth_map = cv2.resize(combined_depth_map, dim, interpolation=cv2.INTER_AREA)
+
+        # save the image
+        cv2.imwrite('depth_map.png', resized_combined_depth_map)
 
         if self.show_process:
             cv2.imshow("Original and Filtered Depth Map", resized_combined_depth_map)
@@ -1476,8 +1575,9 @@ class RopeSegmenter:
                     intersection1=data_list[:3]
                     intersection2=data_list[3:6]
                     tcp=data_list[6:9]
+                    z_axis=data_list[9:12]
 
-                    return intersection1,intersection2,tcp
+                    return intersection1,intersection2,tcp, z_axis
         except FileNotFoundError:
             print(f"File not found: {file_path}")
         except Exception as e:
@@ -1527,7 +1627,7 @@ class RopeSegmenter:
     def main(self):
 
         root = ET.Element("RunTimes")
-        receiver = UDPReceiver(self.udp_host_2, self.udp_port, '/home/kifabrik/Documents/segment-anything-2/intersections.txt')
+        # receiver = UDPReceiver(self.udp_host_2, self.udp_port, '/home/kifabrik/Documents/segment-anything-2/intersections.txt')
         
         # Get intrinsics
         self.get_intrinsics_from_ros()
@@ -1660,21 +1760,23 @@ class RopeSegmenter:
                     # Show the segmented results
                     mask = (out_mask_logits[0] > 0.0).cpu().numpy()
                     if self.show_process:
-                        plt.figure(figsize=(9, 6))
-                        plt.title(f"Segmented Frame {out_frame_idx}")
-                        plt.imshow(image)
-                        self.show_mask(mask, plt.gca(), obj_id=out_obj_ids[0])
-                        plt.show()
+                        # show first mask
+                        if out_frame_idx == 0:
+                            plt.figure(figsize=(9, 6))
+                            plt.title(f"Segmented Frame {out_frame_idx}")
+                            plt.imshow(image)
+                            self.show_mask(mask, plt.gca(), obj_id=out_obj_ids[0])
+                            plt.show()
 
                     video_segments[out_frame_idx] = {
                         out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
                         for i, out_obj_id in enumerate(out_obj_ids)
                     }
-                if self.show_process:
-                    for out_frame_idx in range(0, len(frame_names), 1):
-                        plt.figure(figsize=(6, 4))
-                        plt.title(f"frame {out_frame_idx}")
-                        plt.imshow(PILImage.open(os.path.join(self.video_dir, frame_names[out_frame_idx])))
+                # if self.show_process:
+                #     for out_frame_idx in range(0, len(frame_names), 1):
+                #         plt.figure(figsize=(6, 4))
+                #         plt.title(f"frame {out_frame_idx}")
+                #         plt.imshow(PILImage.open(os.path.join(self.video_dir, frame_names[out_frame_idx])))
                 # Generate 2D rope model using the mask logits
                 averaged_pixel_positions_unsorted, averaged_pixel_positions_sorted_asc = self.generate_2d_rope_model(out_mask_logits,'mean')
 
@@ -1696,8 +1798,10 @@ class RopeSegmenter:
 
                 # data, clusters, labels = self.DBSCAN_filter(rope_3d_positions_base, dbscan_eps=0.02, dbscan_min_samples=10)
                 # interpolated_points = self.interpolate_rope_points(data, clusters, labels)
-
-                interpolated_points = self.DBSCAN_filter(rope_3d_positions_base, dbscan_eps=0.02, dbscan_min_samples=10, pca=True)
+                # for stiff cable
+                interpolated_points, gap_centers, gap_center_indexes = self.DBSCAN_filter(rope_3d_positions_base, dbscan_eps=0.02, dbscan_min_samples=20, pca=True)
+                # for soft cable
+                # interpolated_points, gap_centers, gap_center_indexes = self.DBSCAN_filter(rope_3d_positions_base, dbscan_eps=0.10, dbscan_min_samples=20, pca=True)
 
                 # ----------------------- Correction with Tactile ------------------------- #
                 
@@ -1711,37 +1815,62 @@ class RopeSegmenter:
                 #     self.init_grasp_flag = True
 
                 # # self.init_grasp_point = [0.629,-0.011,0.54]
-                intersection_w_1, intersection_w_2, tcp = self.read_newest_data('/home/kifabrik/Documents/segment-anything-2/intersections.txt')
-            
+                intersection_w_1, intersection_w_2, tcp, z_axis = self.read_newest_data('/home/kifabrik/Documents/segment-anything-2/intersections.txt')
                 
                 # # # center_of_grasp = (np.array(intersection_w_1) + np.array(intersection_w_2)) / 2
                 # # # translation_vector = center_of_grasp - tcp
                 # closest_point_1, closest_point_2 = self.find_closest_points_sam2(interpolated_points, intersection_w_1, intersection_w_2, self.init_grasp_point)
                 # # corrected_rope_points = self.align_and_correct_rope_model(interpolated_points, intersection_w_1, intersection_w_2)
-                corrected_rope_points, corrected_tcp_index = self.correct_rope_model(interpolated_points,intersection_w_1, intersection_w_2)
+                # corrected_rope_points, raw_tcp_index = self.correct_rope_model(interpolated_points,intersection_w_1, intersection_w_2, z_axis)
+                # raw_tcp_index = raw_tcp_index[0][0]
+                corrected_rope_points, raw_tcp_index = self.correct_rope_model2(interpolated_points,intersection_w_1, intersection_w_2, gap_centers, gap_center_indexes)
+
+                raw_grasp_tcp = interpolated_points[raw_tcp_index]
                 # # # Calculate the translation vector to correct the rope position
                 # translation_vector = self.calculate_translation(intersection_w_1, intersection_w_2, closest_point_1, closest_point_2)
 
                 # # # Apply the translation to the entire rope model
                 # corrected_rope_points = self.apply_translation_to_rope(interpolated_points, translation_vector)
 
+                if self.show_process:
+                    plt_interpolated_points = np.array(interpolated_points)
+                    fig = plt.figure(figsize=(10, 8))
+                    ax = fig.add_subplot(111, projection='3d')
+                    ax.plot(plt_interpolated_points[:, 0], plt_interpolated_points[:, 1], plt_interpolated_points[:, 2], marker='o', linestyle='-', label='Raw Rope', color='blue')
+                    ax.scatter(intersection_w_1[0], intersection_w_1[1], intersection_w_1[2], c='r', marker='o', s=100, label='Intersection 1')
+                    ax.scatter(intersection_w_2[0], intersection_w_2[1], intersection_w_2[2], c='r', marker='o', s=100, label='Intersection 2')
+                    ax.scatter(tcp[0], tcp[1], tcp[2], c='b', marker='o', s=150, label='Robot TCP')
+                    ax.scatter(raw_grasp_tcp[0], raw_grasp_tcp[1], raw_grasp_tcp[2], c='g', marker='o', s=100, label='Grasp Point')
+                    ax.plot(corrected_rope_points[:, 0], corrected_rope_points[:, 1], corrected_rope_points[:, 2], marker='o', linestyle='-', label='Corrected Rope', color='darkorange')
+                    ax.set_title('3D Rope Model')
+                    ax.set_xlabel('X Coordinate')
+                    ax.set_ylabel('Y Coordinate')
+                    ax.set_zlabel('Z Coordinate')
+                    ax.set_aspect('equal')
+                    ax.legend()
+                    plt.show()
+
                 
                 self.publish_intersection_points(intersection_w_1, intersection_w_2, tcp)
-                intersection_points = [intersection_w_1, intersection_w_2, tcp]
+                intersection_points = [intersection_w_1, intersection_w_2, tcp, raw_grasp_tcp]
                 self.send_rope_positions_via_udp(intersection_points, self.intersection_port)
                 # self.send_intersections_via_udp(intersection_w_1, intersection_w_2, tcp, self.intersection_port)
-                self.publish_smoothed_rope_marker(corrected_rope_points, [1,0,0]) # red
+                self.publish_smoothed_rope_marker(corrected_rope_points, [1,0,0]) 
                 self.send_rope_positions_via_udp(corrected_rope_points, self.corrected_cable_port)
                 self.publish_grasp_point(tcp)
                 self.publish_smoothed_rope_marker(interpolated_points,[0,1,0]) # green
                 self.send_rope_positions_via_udp(np.array(interpolated_points), self.raw_cable_port)
+
+                rope_points = corrected_rope_points
+                if not self.tactile_correction:
+                    rope_points = np.array(interpolated_points)
                 
-                smoothed_rope = self.smooth_rope_with_spline(corrected_rope_points, smooth_factor=0.03, num_points=70)
+                smoothed_rope = self.smooth_rope_with_spline(rope_points, smooth_factor=0.03, num_points=int(0.7*len(rope_points)))
                 smoothed_rope = np.array(smoothed_rope)
-                # corrected_rope_points = np.array(corrected_rope_points)
-                x1 = corrected_rope_points[:, 0]
-                y1 = corrected_rope_points[:, 1]
-                z1 = corrected_rope_points[:, 2]
+                # rope_points = np.array(rope_points)
+                x1 = rope_points[:, 0]
+                y1 = rope_points[:, 1]
+                z1 = rope_points[:, 2]
                 x = smoothed_rope [:, 0]
                 y = smoothed_rope [:, 1]
                 z = smoothed_rope [:, 2]
@@ -1749,8 +1878,10 @@ class RopeSegmenter:
                 if self.show_process:
                     fig = plt.figure(figsize=(10, 8))
                     ax = fig.add_subplot(111, projection='3d')
-                    ax.plot(x, y, z, marker='o', linestyle='-', label='Smoothed Rope')
-                    ax.plot(x1, y1, z1, marker='o', linestyle='-', label='Corrected Rope')
+                    # ax.plot(x1, y1, z1, marker='o', linestyle='-', label='Corrected Rope', color = 'dogerblue')
+                    ax.plot(x, y, z, marker='o', linestyle='-', label='Smoothed Rope', color='darkorange')
+                    # ax.scatter(raw_grasp_tcp[0], raw_grasp_tcp[1], raw_grasp_tcp[2], c='g', marker='o', s=100, label='Grasp Point')
+                    ax.scatter(tcp[0], tcp[1], tcp[2], c='b', marker='o', s=150, label='Robot TCP')
                     ax.set_title('3D Smoothed Rope')
                     ax.set_xlabel('X Coordinate')
                     ax.set_ylabel('Y Coordinate')
@@ -1780,69 +1911,88 @@ class RopeSegmenter:
 
 
                 # ------------------- Select grasp point on corrected rope ------------------- #
-                desired_distance = 0.15  # Desired distance from the initial grasp point
-                if len(smoothed_rope) > 0:
-                    # # Check if init_grasp_point is on the rope
-                    # if self.is_point_on_rope(tcp, smoothed_rope):
-                    #     # # if it is on the rope
-                    #     # matched_indices = np.where(np.isclose(smoothed_rope, tcp, atol=1e-5).all(axis=1))[0]
-                    #     # if matched_indices.size == 0:
-                    #     #     print("TCP is close to the rope but not exactly on it.")
-                    #     #     return None
-                    #     # grasp_index = matched_indices[0]
-                    #     grasp_index = np.where(np.all(smoothed_rope == tcp, axis=1))[0][0]
-                    # else:
-                    #     # if it is not on the rope
-                    #     closest_point = self.get_closest_point(tcp, smoothed_rope)
-                    #     grasp_index = np.where(np.all(smoothed_rope == closest_point, axis=1))[0][0]
+                if self.second_grasp_command:
+                    # desired_distance = 0.10  # Desired distance from the initial grasp point
+                    if len(smoothed_rope) > 0:
+                        # # Check if init_grasp_point is on the rope
+                        # if self.is_point_on_rope(tcp, smoothed_rope):
+                        #     # # if it is on the rope
+                        #     # matched_indices = np.where(np.isclose(smoothed_rope, tcp, atol=1e-5).all(axis=1))[0]
+                        #     # if matched_indices.size == 0:
+                        #     #     print("TCP is close to the rope but not exactly on it.")
+                        #     #     return None
+                        #     # grasp_index = matched_indices[0]
+                        #     grasp_index = np.where(np.all(smoothed_rope == tcp, axis=1))[0][0]
+                        # else:
+                        #     # if it is not on the rope
+                        #     closest_point = self.get_closest_point(tcp, smoothed_rope)
+                        #     grasp_index = np.where(np.all(smoothed_rope == closest_point, axis=1))[0][0]
 
-                    # Make sure the index is valid and does not exceed the range.
-                    # grasp_index = min(grasp_index - 35, len(smoothed_rope) - 1)
+                        # Make sure the index is valid and does not exceed the range.
+                        # grasp_index = min(grasp_index - 35, len(smoothed_rope) - 1)
 
-                    # selected_point = smoothed_rope[grasp_index]
-                    # tangent_vector, rx, ry, rz = self.calculate_tangent_and_rotation(smoothed_rope, grasp_index)
-                    
-                    distances = np.linalg.norm(smoothed_rope - tcp, axis=1)
-                    tcp_index = np.argmin(distances)
+                        # selected_point = smoothed_rope[grasp_index]
+                        # tangent_vector, rx, ry, rz = self.calculate_tangent_and_rotation(smoothed_rope, grasp_index)
+                        
+                        distances = np.linalg.norm(smoothed_rope - tcp, axis=1)
+                        tcp_index = np.argmin(distances)
 
-                    grasp_index = None
-                    if grasp_index is None:
-                        # Filter distances to consider only indices greater than grasp_index
-                        greater_filtered_distances = distances[tcp_index + 1:]
-                        closest_index_in_greater_filtered = np.argmin(np.abs(greater_filtered_distances - desired_distance))
-                        closest_index_greater = closest_index_in_greater_filtered + tcp_index + 1
-                        greater_selected_point = smoothed_rope[closest_index_greater]
+                        grasp_index = None
+                        if grasp_index is None:
+                            # Filter distances to consider only indices greater than grasp_index
+                            greater_filtered_distances = distances[tcp_index + 1:]
+                            closest_index_in_greater_filtered = np.argmin(np.abs(greater_filtered_distances - self.desired_distance))
+                            closest_index_greater = closest_index_in_greater_filtered + tcp_index + 1
+                            greater_selected_point = smoothed_rope[closest_index_greater]
 
-                        print(f"Greater selected point: {greater_selected_point}")
+                            print(f"Greater selected point: {greater_selected_point}")
 
-                        # TODO@Kejia: temporary solution: select one that is larger in x
-                        if greater_selected_point[0] < tcp[0]:
-                            grasp_index = closest_index_greater
-                    
-                    if grasp_index is None:
-                        # Filter distances to consider only indices smaller than tcp_index
-                        smaller_filtered_distances = distances[:tcp_index]
-                        closest_index_in_smaller_filtered = np.argmin(np.abs(smaller_filtered_distances - desired_distance))
-                        closest_index_smaller = closest_index_in_smaller_filtered
-                        smaller_selected_point = smoothed_rope[closest_index_smaller]
+                            # TODO@Kejia: temporary solution: select one that is larger in x
+                            if greater_selected_point[0] < tcp[0]:
+                                grasp_index = closest_index_greater
+                        
+                        if grasp_index is None:
+                            # Filter distances to consider only indices smaller than tcp_index
+                            smaller_filtered_distances = distances[:tcp_index]
+                            closest_index_in_smaller_filtered = np.argmin(np.abs(smaller_filtered_distances - self.desired_distance))
+                            closest_index_smaller = closest_index_in_smaller_filtered
+                            smaller_selected_point = smoothed_rope[closest_index_smaller]
 
-                        if smaller_selected_point[0] < tcp[0]:
-                            grasp_index = closest_index_smaller
+                            if smaller_selected_point[0] < tcp[0]:
+                                grasp_index = closest_index_smaller
 
-                    selected_point = smoothed_rope[grasp_index]
-                    tangent_vector_at_grasp = compute_tanget_vector_at_grasping(smoothed_rope, grasp_index)
-                    
-                    print(f"Selected point from corrected rope: {selected_point}")
-                    print(f"The tcp of the ur robot: {tcp}")
-                    print(type(selected_point))
+                        selected_point = smoothed_rope[grasp_index]
+                        tangent_vector_at_grasp, normal_vector_at_grasp = compute_tanget_vector_at_grasping(smoothed_rope, grasp_index)
 
-                    # self.send_grasp_point_via_udp(selected_point, rx, ry, rz)
-                    self.send_grasp_point_via_udp(selected_point, tangent_vector_at_grasp)
+                        # plot the selected point and vectors
+                        if self.show_process:
+                            fig = plt.figure(figsize=(10, 8))
+                            ax = fig.add_subplot(111, projection='3d')
+                            ax.plot(x1, y1, z1, marker='o', linestyle='-', label='Corrected Rope')
+                            ax.plot(x, y, z, marker='o', linestyle='-', label='Smoothed Rope')
+                            ax.set_title('3D Smoothed Rope with Grsap Point')
+                            ax.set_xlabel('X Coordinate')
+                            ax.set_ylabel('Y Coordinate')
+                            ax.set_zlabel('Z Coordinate')
+                            ax.set_aspect('equal')
+                            ax.legend()
+                            ax.scatter(selected_point[0], selected_point[1], selected_point[2], c='r', marker='o', s=100, label='Grasp Point')
+                            ax.quiver(selected_point[0], selected_point[1], selected_point[2], tangent_vector_at_grasp[0], tangent_vector_at_grasp[1], tangent_vector_at_grasp[2], color='g', label='Tangent Vector', length=0.1)
+                            ax.quiver(selected_point[0], selected_point[1], selected_point[2], normal_vector_at_grasp[0], normal_vector_at_grasp[1], normal_vector_at_grasp[2], color='b', label='Normal Vector', length=0.1)
+                            plt.show()
 
-                    self.publish_the_second_grasp_point(selected_point)
+                        
+                        print(f"Selected point from corrected rope: {selected_point}")
+                        print(f"The tcp of the ur robot: {tcp}")
+                        print(type(selected_point))
 
-                else:
-                    rospy.logwarn("Corrected rope points are empty. Cannot select or send a point.")
+                        # self.send_grasp_point_via_udp(selected_point, rx, ry, rz)
+                        self.send_grasp_point_via_udp(selected_point, tangent_vector_at_grasp, normal_vector_at_grasp)
+
+                        self.publish_the_second_grasp_point(selected_point)
+
+                    else:
+                        rospy.logwarn("Corrected rope points are empty. Cannot select or send a point.")
 
                 #-------------------------------------------------------------
 
@@ -1870,12 +2020,14 @@ class RopeSegmenter:
 if __name__ == '__main__':
     # arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--show", type=bool, default=False)
-    parser.add_argument("--send_grasp_only", type=bool, default=True)
+    parser.add_argument("--show", type=bool, default=True)
+    parser.add_argument("--send_grasp_only", type=bool, default=False)
+    parser.add_argument("--second_grasp", type=bool, default=True)
+    parser.add_argument("--tactile_correction", type=bool, default=False)
     args = parser.parse_args()
 
     torch.cuda.empty_cache()
-    segmenter = RopeSegmenter(args.show)
+    segmenter = RopeSegmenter(args.show, args.second_grasp, args.tactile_correction, desired_distance=0.08)
 
     if args.send_grasp_only:
         segmenter.send_grasp_point_via_udp(None, None, read_only=True)
